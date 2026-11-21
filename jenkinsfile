@@ -1,0 +1,70 @@
+pipeline {
+    agent any
+
+    environment{
+        VENV=".venv"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                python3 -m venv $VENV
+                . $VENV/bin/activate
+                pip install -r requirements.txt
+                pip install pytest
+                pip install gunicorn
+                pip list
+                '''
+            }
+        }
+       
+        stage('Build Docker Image') {
+            
+            steps {
+                sh '''
+                docker build --no-cache -t  OPSHUB:${BUILD_NUMBER} .
+                '''
+            }
+
+        }
+        stage('deploy Application') {
+            steps {
+                sh '''
+                docker rm -f OPSHUB || true
+                docker run -d --network my_configs_devops --name OPSHUB -p 5001:5000 color-dot:${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        // stage('Health Check') { 
+        //     steps {
+        //         sh '''
+        //         sleep 5
+        //         curl --fail http://color-dot:5000
+
+        //         '''
+        //     }
+        // }
+
+    }
+
+    post {
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+   
+
+}
