@@ -1,4 +1,4 @@
-# Small runtime set. A fresh venv should resolve in seconds, not hours.
+# Small runtime set. A fresh image should resolve in seconds, not hours.
 # Left out on purpose (each already falls back if missing):
 #   laya        -> torch + transformers, several GB; keyword routing remains
 #   chromadb    -> ONNX embedding stack; runbook search stays on Postgres
@@ -12,3 +12,4 @@ python-dotenv>=1.0,<2
 requests>=2.32,<3
 ollama>=0.4,<1
 pypdf>=5.0,<6
+gunicorn>=22,<26

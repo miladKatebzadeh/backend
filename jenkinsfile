@@ -1,37 +1,23 @@
 pipeline {
     agent any
 
-    environment{
-        VENV=".venv"
+    environment {
         APP_NAME = 'opshubbackend'
         HOST_PORT = '3000'
         CONTAINER_PORT = '3000'
     }
 
     stages {
-
         stage('Checkout') {
             steps {
                 checkout scm
             }
         }
 
-        stage('Install Dependencies') {
-            steps {
-                sh '''
-                python3 -m venv $VENV
-                . $VENV/bin/activate
-                pip install -r requirements.txt
-                pip install pytest
-                pip install gunicorn
-                pip list
-                '''
-            }
-        }
-       
         stage('Build Docker Image') {
             steps {
-                // ساخت ایمیج جدید با تگ شماره بیلد جنکینز
+                // وابستگی فقط داخل ایمیج نصب می‌شود. venv روی ایجنت ساخته نمی‌شود
+                // چون هم دوباره دانلود می‌شد هم با docker build به داخل ایمیج کپی می‌شد.
                 sh "docker build -t ${APP_NAME}:${BUILD_NUMBER} ."
                 sh "docker tag ${APP_NAME}:${BUILD_NUMBER} ${APP_NAME}:latest"
             }
@@ -39,7 +25,6 @@ pipeline {
 
         stage('Deploy Container') {
             steps {
-                // توقف و حذف کانتینر قبلی (در صورت وجود) و اجرای کانتینر جدید
                 sh """
                     docker stop ${APP_NAME} || true
                     docker rm ${APP_NAME} || true
@@ -47,16 +32,6 @@ pipeline {
                 """
             }
         }
-        // stage('Health Check') { 
-        //     steps {
-        //         sh '''
-        //         sleep 5
-        //         curl --fail http://color-dot:5000
-
-        //         '''
-        //     }
-        // }
-
     }
 
     post {
@@ -68,6 +43,4 @@ pipeline {
             echo 'Pipeline failed!'
         }
     }
-   
-
 }
