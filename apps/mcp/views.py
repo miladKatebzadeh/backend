@@ -105,3 +105,263 @@ def _clean_setting(key, value):
     if key == 'jenkins_user' and any(char.isspace() for char in value):
         raise ValueError('jenkins_user cannot contain spaces')
     return value
+
+
+def _stored_settings():
+    defaults = _defaults()
+    stored = {row.key: row.value for row in SystemSetting.objects.all()}
+    payload = {}
+    for key, default in defaults.items():
+        if key in stored:
+            payload[key] = stored[key]
+        else:
+            payload[key] = default
+    payload['jenkins_token'] = ''
+    payload['jenkins_token_set'] = bool(stored.get('jenkins_token'))
+    return payload
+
+
+def _confirmed(value):
+    return str(value).lower() in ('1', 'true', 'yes', 'on')
+
+
+class MCPToolViewSet(viewsets.ModelViewSet):
+    serializer_class = MCPToolSerializer
+
+    def get_queryset(self):
+        queryset = MCPTool.objects.all().order_by('-updated_at')
+        if self.request.query_params.get('include_archived') != 'true':
+            queryset = queryset.filter(archived_at__isnull=True)
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        data = request.data.copy()
+        if not data.get('status'):
+            data['status'] = 'active'
+        if data.get('name'):
+            data['name'] = data['name'].strip().replace(' ', '_')
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return response.Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def perform_create(self, serializer):
+        tool = serializer.save()
+        MCPToolVersion.objects.create(
+            tool=tool,
+            version=1,
+            description=tool.description or 'Initial tool',
+            code=tool.code or '',
+        )
+        AuditEvent.objects.create(action='create', resource_type='mcp_tool', resource_id=str(tool.pk), payload={'name': tool.name})
+
+    def update(self, request, *args, **kwargs):
+        kwargs.pop('partial', True)
+        instance = self.get_object()
+        data = request.data.copy()
+        if data.get('name'):
+            data['name'] = data['name'].strip().replace(' ', '_')
+        serializer = self.get_serializer(instance, data=data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return response.Response(serializer.data)
+
+    def perform_update(self, serializer):
+        tool = serializer.save()
+        last_version = tool.versions.order_by('-version').first()
+        next_version = (last_version.version if last_version else 0) + 1
+        MCPToolVersion.objects.create(tool=tool, version=next_version, description=tool.description, code=tool.code)
+        AuditEvent.objects.create(
+            action='update',
+            resource_type='mcp_tool',
+            resource_id=str(tool.pk),
+            payload={'version': next_version},
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        tool = self.get_object()
+        if request.query_params.get('confirm') != 'true':
+            return response.Response({'detail': 'Deletion requires confirm=true.'}, status=status.HTTP_400_BAD_REQUEST)
+        tool.archived_at = timezone.now()
+        tool.status = 'archived'
+        tool.save(update_fields=['archived_at', 'status', 'updated_at'])
+        AuditEvent.objects.create(action='delete', resource_type='mcp_tool', resource_id=str(tool.pk), payload={'mode': 'soft_delete'})
+        return response.Response(status=status.HTTP_204_NO_CONTENT)
+
+    @decorators.action(detail=True, methods=['post'])
+    def run(self, request, pk=None):
+        tool = self.get_object()
+        if tool.archived_at or tool.status == 'archived':
+            return response.Response({'detail': 'Archived tools cannot run.'}, status=status.HTTP_400_BAD_REQUEST)
+        target = str(request.data.get('target') or '')
+        return response.Response(MCPSandboxExecutor.execute_tool_safe(tool.code, {'TARGET_RESOURCE': target}))
+
+
+@decorators.api_view(['POST'])
+def mcp_ai_chat(request):
+    user_message = (request.data.get('message') or '').strip()
+    if not user_message:
+        return response.Response({'detail': 'Message payload cannot be empty.'}, status=400)
+    result = diagnose(user_message, allow_remediation=False)
+    decisions = result.get('decisions') or {}
+    return response.Response({
+        'reply': result['reply'],
+        'engine_status': result['engine_status'],
+        'router': decisions.get('router', 'keywords'),
+        'laya_model': decisions.get('laya_model', ''),
+    })
+
+
+@decorators.api_view(['GET', 'POST'])
+def save_system_settings(request):
+    if request.method == 'GET':
+        return response.Response(_stored_settings())
+
+    if not request.data:
+        return response.Response({'detail': 'No configuration payload provided.'}, status=400)
+    cleaned = {}
+    errors = {}
+    for key, raw_value in request.data.items():
+        if key in CONTROL_KEYS:
+            continue
+        if key not in PUBLIC_SETTINGS:
+            errors[key] = 'unknown setting'
+            continue
+        value = str(raw_value).strip()
+        if value == '':
+            if key == 'jenkins_token':
+                continue
+            if key in CLEARABLE_SETTINGS:
+                cleaned[key] = ''
+                continue
+            errors[key] = 'This field cannot be empty.'
+            continue
+        try:
+            cleaned[key] = _clean_setting(key, value)
+        except ValueError as exc:
+            errors[key] = str(exc)
+    if errors:
+        return response.Response({'detail': 'Invalid settings.', 'errors': errors}, status=400)
+    if not cleaned:
+        return response.Response({'status': 'success', 'saved': [], 'notes': []})
+
+    reindex = False
+    if 'embedding_engine' in cleaned:
+        current = get_setting('embedding_engine', _defaults()['embedding_engine'])
+        if cleaned['embedding_engine'] != current:
+            if not _confirmed(request.data.get('confirm_reindex', '')):
+                return response.Response({
+                    'detail': 'Changing the embedding model rebuilds the knowledge index.',
+                    'code': 'reindex_required',
+                    'errors': {'embedding_engine': 'Confirm reindex before saving a new embedding model.'},
+                }, status=409)
+            reindex = True
+
+    for key, value in cleaned.items():
+        set_setting(key, value)
+
+    audit_payload = {key: value for key, value in cleaned.items() if key not in SECRET_SETTINGS}
+    if 'jenkins_token' in cleaned:
+        audit_payload['jenkins_token'] = 'updated'
+    AuditEvent.objects.create(
+        action='update',
+        resource_type='system_setting',
+        resource_id=','.join(sorted(cleaned)),
+        payload=audit_payload,
+    )
+    notes = []
+    if 'scrape_interval' in cleaned:
+        notes.append('scrape_interval applies on the next collector cycle')
+    body = {'status': 'success', 'saved': sorted(cleaned), 'notes': notes}
+    if reindex:
+        from apps.knowledge.chroma import rebuild_knowledge_index
+        body['reindex'] = rebuild_knowledge_index()
+    return response.Response(body)
+
+
+def _probe_value(data, key):
+    if key in data:
+        return str(data.get(key) or '').strip()
+    defaults = _defaults()
+    return get_setting(key, defaults.get(key, ''))
+
+
+@decorators.api_view(['POST'])
+def test_system_settings(request):
+    service = str(request.data.get('service') or '').strip()
+    started = time.perf_counter()
+    try:
+        if service == 'ollama':
+            host = _clean_setting('ollama_host', _probe_value(request.data, 'ollama_host'))
+            probed = requests.get(f'{host}/api/tags', timeout=3, allow_redirects=False)
+            probed.raise_for_status()
+            models = []
+            for item in probed.json().get('models') or []:
+                name = item.get('name') or item.get('model')
+                if name:
+                    models.append(name)
+            message = f'{len(models)} model(s)'
+            extra = {'models': models}
+        elif service == 'prometheus':
+            url = _clean_setting('prometheus_url', _probe_value(request.data, 'prometheus_url'))
+            probed = requests.get(f'{url}/-/ready', timeout=3, allow_redirects=False)
+            probed.raise_for_status()
+            message = 'ready'
+            extra = {}
+        elif service == 'jenkins':
+            url = _clean_setting('jenkins_url', _probe_value(request.data, 'jenkins_url'))
+            user = _probe_value(request.data, 'jenkins_user')
+            token = str(request.data.get('jenkins_token') or '').strip() or get_setting('jenkins_token', os.getenv('JENKINS_TOKEN', ''))
+            auth = (user, token) if user and token else None
+            probed = requests.get(f'{url}/whoAmI/api/json', auth=auth, timeout=3, allow_redirects=False)
+            probed.raise_for_status()
+            message = probed.json().get('name') or 'reachable'
+            extra = {}
+        elif service == 'docker':
+            raw = _probe_value(request.data, 'docker_host')
+            if not str(raw).strip():
+                raise ValueError('docker_host must be an http(s) URL')
+            url = _clean_setting('docker_host', raw)
+            probed = requests.get(f'{url}/version', timeout=3, allow_redirects=False)
+            probed.raise_for_status()
+            message = str((probed.json() or {}).get('Version') or 'reachable')
+            extra = {}
+        elif service == 'chroma':
+            host = _clean_setting('chroma_host', _probe_value(request.data, 'chroma_host'))
+            port = _clean_setting('chroma_port', _probe_value(request.data, 'chroma_port'))
+            probed = requests.get(f'http://{host}:{port}/api/v2/heartbeat', timeout=3, allow_redirects=False)
+            if probed.status_code == 404:
+                probed = requests.get(f'http://{host}:{port}/api/v1/heartbeat', timeout=3, allow_redirects=False)
+            probed.raise_for_status()
+            message = 'heartbeat'
+            extra = {}
+        else:
+            return response.Response({'detail': 'Unknown service.', 'errors': {'service': 'unknown service'}}, status=400)
+    except ValueError as exc:
+        return response.Response({'status': 'invalid', 'latency_ms': 0, 'message': str(exc)})
+    except Exception as exc:
+        latency = int((time.perf_counter() - started) * 1000)
+        return response.Response({'status': 'offline', 'latency_ms': latency, 'message': exc.__class__.__name__})
+    latency = int((time.perf_counter() - started) * 1000)
+    return response.Response({'status': 'connected', 'latency_ms': latency, 'message': message, **extra})
+
+
+@decorators.api_view(['GET'])
+def list_local_ollama_models(request):
+    override = str(request.GET.get('host') or '').strip()
+    if override:
+        try:
+            ollama_host = _clean_setting('ollama_host', override)
+        except ValueError as exc:
+            return response.Response({'status': 'invalid', 'models': [], 'message': str(exc)}, status=400)
+    else:
+        ollama_host = get_setting('ollama_host', os.getenv('OLLAMA_HOST', 'http://localhost:11434'))
+    try:
+        import ollama
+        client = ollama.Client(host=ollama_host)
+        local_models = client.list().get('models', [])
+        model_tags = [item.get('model') for item in local_models if item.get('model')]
+        return response.Response({'status': 'success', 'models': model_tags})
+    except Exception as exc:
+        return response.Response({'status': 'offline', 'models': [], 'message': exc.__class__.__name__})
