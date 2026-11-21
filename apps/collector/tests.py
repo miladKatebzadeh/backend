@@ -53,3 +53,38 @@ class DockerApiCollectorTests(TestCase):
             StandaloneCollectorDaemon.collect_docker_data()
         get.assert_not_called()
         self.assertEqual(DockerMetric.objects.count(), 0)
+
+    def test_alertmanager_and_prometheus_alerts_are_stored(self):
+        from apps.collector.models import PrometheusAlert
+        from apps.mcp.models import set_setting
+        set_setting('alertmanager_url', 'http://10.0.0.8:9093')
+
+        class Response:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+            def raise_for_status(self):
+                return None
+
+        def fake_get(url, params=None, timeout=None):
+            if url.endswith('/api/v2/alerts'):
+                return Response([{'labels': {'alertname': 'DiskLow'}, 'status': {'state': 'active'}}])
+            if url.endswith('/api/v1/alerts'):
+                return Response({'data': {'alerts': [{'labels': {'alertname': 'HighCPU'}, 'state': 'firing', 'value': '91'}]}})
+            if url.endswith('/api/v1/label/__name__/values'):
+                return Response({'data': []})
+            if '/api/v1/query' in url:
+                return Response({'data': {'result': []}})
+            raise AssertionError(url)
+
+        with patch('apps.collector.tasks.requests.get', side_effect=fake_get):
+            StandaloneCollectorDaemon.collect_prometheus_data()
+        disk = PrometheusAlert.objects.get(metric_name='alert:DiskLow')
+        cpu = PrometheusAlert.objects.get(metric_name='alert:HighCPU')
+        self.assertEqual(disk.metric_type, 'alertmanager')
+        self.assertEqual(disk.alert_status, 'FIRING')
+        self.assertEqual(cpu.metric_type, 'prometheus_alert')
+        self.assertEqual(cpu.alert_status, 'FIRING')
