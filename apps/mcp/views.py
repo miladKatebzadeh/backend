@@ -18,19 +18,30 @@ PUBLIC_SETTINGS = (
     'ollama_host',
     'ollama_model',
     'prometheus_url',
+    'alertmanager_url',
     'jenkins_url',
     'docker_host',
     'jenkins_user',
     'jenkins_token',
     'scrape_interval',
+    'memory_min_mb',
+    'disk_min_gb',
+    'cpu_max_percent',
+    'tool_timeout',
     'chroma_host',
     'chroma_port',
     'embedding_engine',
     'auto_remediate',
 )
 SECRET_SETTINGS = {'jenkins_token'}
-URL_SETTINGS = {'ollama_host', 'prometheus_url', 'jenkins_url', 'docker_host'}
-CLEARABLE_SETTINGS = {'jenkins_user', 'docker_host'}
+URL_SETTINGS = {'ollama_host', 'prometheus_url', 'alertmanager_url', 'jenkins_url', 'docker_host'}
+CLEARABLE_SETTINGS = {'jenkins_user', 'docker_host', 'alertmanager_url'}
+INTEGER_SETTINGS = {
+    'memory_min_mb': (64, 1_048_576),
+    'disk_min_gb': (1, 100_000),
+    'cpu_max_percent': (1, 100),
+    'tool_timeout': (5, 180),
+}
 CONTROL_KEYS = {'confirm_reindex'}
 BLOCKED_HOSTS = {'169.254.169.254', 'metadata.google.internal'}
 
@@ -40,11 +51,16 @@ def _defaults():
         'ollama_host': os.getenv('OLLAMA_HOST', 'http://localhost:11434'),
         'ollama_model': os.getenv('OLLAMA_MODEL', 'qwen2.5-coder:7b'),
         'prometheus_url': os.getenv('PROMETHEUS_URL', 'http://127.0.0.1:9090'),
+        'alertmanager_url': os.getenv('ALERTMANAGER_URL', ''),
         'jenkins_url': os.getenv('JENKINS_URL', 'http://127.0.0.1:8080'),
         'docker_host': os.getenv('DOCKER_API_URL', ''),
         'jenkins_user': os.getenv('JENKINS_USER', ''),
         'jenkins_token': '',
         'scrape_interval': os.getenv('SCRAPE_INTERVAL', '15'),
+        'memory_min_mb': '1024',
+        'disk_min_gb': '5',
+        'cpu_max_percent': '85',
+        'tool_timeout': os.getenv('OPSHUB_TOOL_TIMEOUT', '60'),
         'chroma_host': os.getenv('CHROMA_HOST', 'localhost'),
         'chroma_port': os.getenv('CHROMA_PORT', '8001'),
         'embedding_engine': 'all-MiniLM-L6-v2',
@@ -90,6 +106,12 @@ def _clean_setting(key, value):
         if not 5 <= seconds <= 3600:
             raise ValueError('scrape_interval must be between 5 and 3600 seconds')
         return str(seconds)
+    if key in INTEGER_SETTINGS:
+        low, high = INTEGER_SETTINGS[key]
+        number = int(value)
+        if not low <= number <= high:
+            raise ValueError(f'{key} must be between {low} and {high}')
+        return str(number)
     if key == 'auto_remediate':
         return '1' if value.lower() in ('1', 'true', 'yes', 'on') else '0'
     if key == 'chroma_host':
@@ -198,18 +220,58 @@ class MCPToolViewSet(viewsets.ModelViewSet):
         return response.Response(MCPSandboxExecutor.execute_tool_safe(tool.code, {'TARGET_RESOURCE': target}))
 
 
+def _wants_remediation(value):
+    return str(value).lower() in ('1', 'true', 'yes', 'on')
+
+
+def _action_payload(result):
+    agent = result.get('agent_automation') or {}
+    sandbox = agent.get('sandbox_output') or {}
+    if not agent.get('agent_triggered'):
+        return {
+            'triggered': False,
+            'tool': '',
+            'success': False,
+            'sandbox': sandbox.get('sandbox') or '',
+            'resolved': False,
+            'message': agent.get('error') or '',
+        }
+    parts = []
+    if sandbox.get('stdout'):
+        parts.append(str(sandbox['stdout']))
+    if sandbox.get('error'):
+        parts.append(str(sandbox['error']))
+    if sandbox.get('warning'):
+        parts.append(str(sandbox['warning']))
+    if agent.get('checked') not in (None, 'running') and sandbox.get('success'):
+        parts.append(f"Container is {agent.get('checked')}, so this is not marked resolved.")
+    elif agent.get('resolved'):
+        parts.append('Container is running.')
+    return {
+        'triggered': True,
+        'tool': agent.get('matched_tool') or '',
+        'success': bool(sandbox.get('success')),
+        'sandbox': sandbox.get('sandbox') or '',
+        'resolved': bool(agent.get('resolved')),
+        'message': '\n'.join(parts),
+    }
+
+
 @decorators.api_view(['POST'])
 def mcp_ai_chat(request):
     user_message = (request.data.get('message') or '').strip()
     if not user_message:
         return response.Response({'detail': 'Message payload cannot be empty.'}, status=400)
-    result = diagnose(user_message, allow_remediation=False)
+    auto = _wants_remediation(get_setting('auto_remediate', '0'))
+    requested = _wants_remediation(request.data.get('remediate', ''))
+    result = diagnose(user_message, allow_remediation=auto or requested)
     decisions = result.get('decisions') or {}
     return response.Response({
         'reply': result['reply'],
         'engine_status': result['engine_status'],
         'router': decisions.get('router', 'keywords'),
         'laya_model': decisions.get('laya_model', ''),
+        'action': _action_payload(result),
     })
 
 
@@ -326,6 +388,15 @@ def test_system_settings(request):
             probed = requests.get(f'{url}/version', timeout=3, allow_redirects=False)
             probed.raise_for_status()
             message = str((probed.json() or {}).get('Version') or 'reachable')
+            extra = {}
+        elif service == 'alertmanager':
+            raw = _probe_value(request.data, 'alertmanager_url')
+            if not str(raw).strip():
+                raise ValueError('alertmanager_url must be an http(s) URL')
+            url = _clean_setting('alertmanager_url', raw)
+            probed = requests.get(f'{url}/api/v2/status', timeout=3, allow_redirects=False)
+            probed.raise_for_status()
+            message = 'ready'
             extra = {}
         elif service == 'chroma':
             host = _clean_setting('chroma_host', _probe_value(request.data, 'chroma_host'))
