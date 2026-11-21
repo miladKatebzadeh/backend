@@ -20,19 +20,36 @@ DEFAULT_WATCHED_METRICS = (
 def classify_metric(query: str, value: float) -> tuple[str, str]:
     name = query or ''
     lowered = name.lower()
+    limits = _threshold_limits()
     if 'memavailable' in lowered:
-        if value < 1024 ** 3:
+        if value < limits['memory_min_bytes']:
             return 'CRITICAL_LOW_MEMORY', 'host_memory_bounds'
         return 'NORMAL', 'host_memory_bounds'
     if 'filesystem' in lowered and any(token in lowered for token in ('avail', 'free')):
-        if value < 5 * 1024 ** 3:
+        if value < limits['disk_min_bytes']:
             return 'CRITICAL_DISK_FULL', 'host_disk_space'
         return 'NORMAL', 'host_disk_space'
     if any(token in lowered for token in ('cpu_percent', 'cpu_usage_percent', 'utilization')) and 0 <= value <= 100:
-        if value > 85:
+        if value > limits['cpu_max_percent']:
             return 'CRITICAL_SPIKE', 'host_cpu_utilization'
         return 'NORMAL', 'host_cpu_utilization'
     return 'NORMAL', 'generic'
+
+
+def _bounded_int(key, default, low, high):
+    try:
+        value = int(get_setting(key, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
+def _threshold_limits():
+    return {
+        'memory_min_bytes': _bounded_int('memory_min_mb', 1024, 64, 1_048_576) * 1024 * 1024,
+        'disk_min_bytes': _bounded_int('disk_min_gb', 5, 1, 100_000) * (1024 ** 3),
+        'cpu_max_percent': _bounded_int('cpu_max_percent', 85, 1, 100),
+    }
 
 
 def _docker_api():
@@ -56,6 +73,29 @@ def _decode_docker_logs(raw: bytes) -> str:
             index += size
         raw = b''.join(parts)
     return raw.decode('utf-8', errors='ignore').strip()
+
+
+def container_state(name: str):
+    """Live Docker state for one container. None means the API could not be checked."""
+    base = _docker_api()
+    wanted = str(name or '').strip().lstrip('/')
+    if not base or not wanted:
+        return None
+    try:
+        listed = requests.get(f'{base}/containers/json', params={'all': 1}, timeout=5)
+        listed.raise_for_status()
+        containers = listed.json()
+    except Exception:
+        logger.exception('Could not confirm container %s', wanted)
+        return None
+    if not isinstance(containers, list):
+        return None
+    for item in containers:
+        names = [str(entry).lstrip('/') for entry in (item.get('Names') or [])]
+        ident = str(item.get('Id') or '')
+        if wanted in names or ident.startswith(wanted):
+            return str(item.get('State') or 'unknown')
+    return 'missing'
 
 
 def _cpu_percent(stats: dict) -> float:
@@ -223,8 +263,13 @@ class StandaloneCollectorDaemon:
     def collect_prometheus_data(cls):
         from apps.collector.models import PrometheusAlert
         prom_url = get_setting('prometheus_url', os.getenv('PROMETHEUS_URL', 'http://127.0.0.1:9090')).rstrip('/')
-        if not prom_url:
-            return
+        if prom_url:
+            cls._collect_prometheus_queries(prom_url)
+        cls._collect_firing_alerts(prom_url)
+
+    @classmethod
+    def _collect_prometheus_queries(cls, prom_url):
+        from apps.collector.models import PrometheusAlert
         try:
             catalog_response = requests.get(f'{prom_url}/api/v1/label/__name__/values', timeout=5)
             catalog_response.raise_for_status()
@@ -233,7 +278,6 @@ class StandaloneCollectorDaemon:
                 set_setting('prometheus_catalog', json.dumps(names[:5000]))
         except Exception as exc:
             logger.error('Prometheus catalog failed: %s', exc)
-            names = []
 
         try:
             watched = json.loads(get_setting('watched_metrics', '[]') or '[]')
@@ -282,6 +326,64 @@ class StandaloneCollectorDaemon:
                     setattr(current, field, field_value)
                 current.save()
                 PrometheusAlert.objects.filter(metric_name=query).exclude(pk=current.pk).delete()
+
+    @classmethod
+    def _collect_firing_alerts(cls, prom_url):
+        from apps.collector.models import PrometheusAlert
+        found = []
+        if prom_url:
+            try:
+                response = requests.get(f'{prom_url}/api/v1/alerts', timeout=5)
+                response.raise_for_status()
+                alerts = (response.json().get('data') or {}).get('alerts') or []
+                for item in alerts:
+                    state = str(item.get('state') or '').lower()
+                    if state not in ('firing', 'pending'):
+                        continue
+                    labels = item.get('labels') or {}
+                    name = str(labels.get('alertname') or 'prometheus')
+                    try:
+                        value = float(item.get('value') or 0)
+                    except (TypeError, ValueError):
+                        value = 0
+                    found.append((f'alert:{name}', value, labels, 'FIRING' if state == 'firing' else 'PENDING', 'prometheus_alert'))
+            except Exception as exc:
+                logger.error('Prometheus alerts failed: %s', exc)
+
+        alertmanager = get_setting('alertmanager_url', os.getenv('ALERTMANAGER_URL', '')).strip().rstrip('/')
+        if alertmanager:
+            try:
+                response = requests.get(f'{alertmanager}/api/v2/alerts', params={'active': 'true'}, timeout=5)
+                response.raise_for_status()
+                body = response.json()
+                if isinstance(body, list):
+                    for item in body:
+                        labels = item.get('labels') or {}
+                        name = str(labels.get('alertname') or 'alertmanager')
+                        state = str((item.get('status') or {}).get('state') or 'active').lower()
+                        status = 'FIRING' if state in ('active', 'firing') else 'PENDING'
+                        found.append((f'alert:{name}', 1, labels, status, 'alertmanager'))
+            except Exception as exc:
+                logger.error('Alertmanager collection failed: %s', exc)
+
+        kept = []
+        for name, value, labels, alert_status, metric_type in found:
+            current = PrometheusAlert.objects.filter(metric_name=name, metric_type=metric_type).order_by('-id').first()
+            payload = {
+                'value': value,
+                'labels': labels,
+                'alert_status': alert_status,
+                'metric_type': metric_type,
+                'updated_at': timezone.now(),
+            }
+            if current is None:
+                current = PrometheusAlert.objects.create(metric_name=name, **payload)
+            else:
+                for field, field_value in payload.items():
+                    setattr(current, field, field_value)
+                current.save()
+            kept.append(current.pk)
+        PrometheusAlert.objects.filter(metric_type__in=('prometheus_alert', 'alertmanager')).exclude(pk__in=kept).delete()
 
     @classmethod
     def run_continuous_loop(cls):
