@@ -3,6 +3,9 @@ pipeline {
 
     environment{
         VENV=".venv"
+        APP_NAME = 'opshubbackend'
+        HOST_PORT = '3000'
+        CONTAINER_PORT = '3000'
     }
 
     stages {
@@ -27,23 +30,23 @@ pipeline {
         }
        
         stage('Build Docker Image') {
-            
             steps {
-                sh '''
-                docker build --no-cache -t  OPSHUB:${BUILD_NUMBER} .
-                '''
-            }
-
-        }
-        stage('deploy Application') {
-            steps {
-                sh '''
-                docker rm -f OPSHUB || true
-                docker run -d --network my_configs_devops --name OPSHUB -p 5001:5000 color-dot:${BUILD_NUMBER}
-                '''
+                // ساخت ایمیج جدید با تگ شماره بیلد جنکینز
+                sh "docker build -t ${APP_NAME}:${BUILD_NUMBER} ."
+                sh "docker tag ${APP_NAME}:${BUILD_NUMBER} ${APP_NAME}:latest"
             }
         }
 
+        stage('Deploy Container') {
+            steps {
+                // توقف و حذف کانتینر قبلی (در صورت وجود) و اجرای کانتینر جدید
+                sh """
+                    docker stop ${APP_NAME} || true
+                    docker rm ${APP_NAME} || true
+                    docker run -d --name ${APP_NAME} --restart unless-stopped -p ${HOST_PORT}:${CONTAINER_PORT} ${APP_NAME}:latest
+                """
+            }
+        }
         // stage('Health Check') { 
         //     steps {
         //         sh '''
