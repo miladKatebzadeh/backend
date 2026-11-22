@@ -331,11 +331,15 @@ class StandaloneCollectorDaemon:
     def _collect_firing_alerts(cls, prom_url):
         from apps.collector.models import PrometheusAlert
         found = []
+        successful_sources = set()
         if prom_url:
             try:
                 response = requests.get(f'{prom_url}/api/v1/alerts', timeout=5)
                 response.raise_for_status()
                 alerts = (response.json().get('data') or {}).get('alerts') or []
+                if not isinstance(alerts, list):
+                    raise ValueError('Prometheus returned an invalid alerts payload')
+                parsed_alerts = []
                 for item in alerts:
                     state = str(item.get('state') or '').lower()
                     if state not in ('firing', 'pending'):
@@ -346,7 +350,9 @@ class StandaloneCollectorDaemon:
                         value = float(item.get('value') or 0)
                     except (TypeError, ValueError):
                         value = 0
-                    found.append((f'alert:{name}', value, labels, 'FIRING' if state == 'firing' else 'PENDING', 'prometheus_alert'))
+                    parsed_alerts.append((f'alert:{name}', value, labels, 'FIRING' if state == 'firing' else 'PENDING', 'prometheus_alert'))
+                found.extend(parsed_alerts)
+                successful_sources.add('prometheus_alert')
             except Exception as exc:
                 logger.error('Prometheus alerts failed: %s', exc)
 
@@ -356,17 +362,21 @@ class StandaloneCollectorDaemon:
                 response = requests.get(f'{alertmanager}/api/v2/alerts', params={'active': 'true'}, timeout=5)
                 response.raise_for_status()
                 body = response.json()
-                if isinstance(body, list):
-                    for item in body:
-                        labels = item.get('labels') or {}
-                        name = str(labels.get('alertname') or 'alertmanager')
-                        state = str((item.get('status') or {}).get('state') or 'active').lower()
-                        status = 'FIRING' if state in ('active', 'firing') else 'PENDING'
-                        found.append((f'alert:{name}', 1, labels, status, 'alertmanager'))
+                if not isinstance(body, list):
+                    raise ValueError('Alertmanager returned an invalid alerts payload')
+                parsed_alerts = []
+                for item in body:
+                    labels = item.get('labels') or {}
+                    name = str(labels.get('alertname') or 'alertmanager')
+                    state = str((item.get('status') or {}).get('state') or 'active').lower()
+                    status = 'FIRING' if state in ('active', 'firing') else 'PENDING'
+                    parsed_alerts.append((f'alert:{name}', 1, labels, status, 'alertmanager'))
+                found.extend(parsed_alerts)
+                successful_sources.add('alertmanager')
             except Exception as exc:
                 logger.error('Alertmanager collection failed: %s', exc)
 
-        kept = []
+        kept_by_source = {source: set() for source in successful_sources}
         for name, value, labels, alert_status, metric_type in found:
             current = PrometheusAlert.objects.filter(metric_name=name, metric_type=metric_type).order_by('-id').first()
             payload = {
@@ -382,8 +392,15 @@ class StandaloneCollectorDaemon:
                 for field, field_value in payload.items():
                     setattr(current, field, field_value)
                 current.save()
-            kept.append(current.pk)
-        PrometheusAlert.objects.filter(metric_type__in=('prometheus_alert', 'alertmanager')).exclude(pk__in=kept).delete()
+            if metric_type in kept_by_source:
+                kept_by_source[metric_type].add(current.pk)
+
+        # An alert is cleared only after its own provider successfully confirms
+        # that it is no longer active. Provider outages must not resolve alerts.
+        now = timezone.now()
+        for source, kept_ids in kept_by_source.items():
+            stale = PrometheusAlert.objects.filter(metric_type=source).exclude(pk__in=kept_ids)
+            stale.update(alert_status='NORMAL', updated_at=now)
 
     @classmethod
     def run_continuous_loop(cls):
@@ -396,6 +413,11 @@ class StandaloneCollectorDaemon:
                 cls.collect_docker_data()
                 cls.collect_jenkins_data()
                 cls.collect_prometheus_data()
+                try:
+                    from apps.incidents.services import sync_incidents_from_telemetry
+                    sync_incidents_from_telemetry()
+                except Exception:
+                    logger.exception('Incident synchronization failed')
                 monitor_incident_daemon()
             except Exception:
                 logger.exception('Collector loop fault')
