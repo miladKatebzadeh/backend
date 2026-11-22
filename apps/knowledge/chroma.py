@@ -205,7 +205,7 @@ def rebuild_knowledge_index():
             except ValueError:
                 logger.warning('Could not parse front matter for knowledge document %s during rebuild', document.pk, exc_info=True)
                 front_matter = {}
-            metadata = {**metadata, **front_matter}
+            metadata = {**front_matter, **metadata}
             metadata['content_hash'] = content_fingerprint(document.content)
             source = metadata.get('source') or 'Manual Ingestion'
             document.title = str(metadata.get('title') or document.title)[:240]
