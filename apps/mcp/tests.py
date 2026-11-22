@@ -498,6 +498,35 @@ class MCPToolApiTests(APITestCase):
             diagnostics._laya_loading = False
             self.laya.start()
 
+    def test_startup_probe_requires_both_english_and_persian_responses(self):
+        import apps.mcp.diagnostics as diagnostics
+        self.laya.stop()
+        diagnostics._laya_checked = False
+        diagnostics._laya_model = None
+        diagnostics._laya_loading = False
+        calls = []
+
+        class PartialRouter:
+            def predict(self, state, questions):
+                calls.append(state['message'])
+                return {'answers': {}} if len(calls) == 1 else None
+
+        class LayaModule:
+            @staticmethod
+            def Router(preload=False):
+                return PartialRouter()
+
+        try:
+            with patch.dict(sys.modules, {'laya': LayaModule}):
+                diagnostics.warmup_laya()
+            self.assertEqual(len(calls), 2)
+            self.assertIsNone(diagnostics.get_laya())
+        finally:
+            diagnostics._laya_checked = False
+            diagnostics._laya_model = None
+            diagnostics._laya_loading = False
+            self.laya.start()
+
     def test_startup_probe_retires_laya_when_it_does_not_answer(self):
         import time
         import apps.mcp.diagnostics as diagnostics
