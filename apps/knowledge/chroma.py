@@ -115,6 +115,7 @@ def index_document(
         return 0
 
     source = source or document_metadata.get("source") or "Manual Ingestion"
+    effective_title = str(document_metadata.get("title") or title or "runbook")[:240]
     keywords = document_metadata.get("keywords") or []
     if isinstance(keywords, str):
         keywords = [item.strip() for item in keywords.replace(";", ",").split(",") if item.strip()]
@@ -129,14 +130,14 @@ def index_document(
     metadatas = []
     for index, chunk in enumerate(chunks):
         context = [
-            f"Title: {title or document_metadata.get('title') or 'Runbook'}",
+            f"Title: {effective_title}",
             f"Section: {section}",
             f"Component: {component}",
             f"Keywords: {keywords_text}",
         ]
         documents.append("\n".join(item for item in context if item.strip()) + "\n\n" + chunk)
         metadata_item = {
-            "title": str(title or document_metadata.get("title") or "runbook"),
+            "title": effective_title,
             "source": str(source),
             "document_id": str(document_id),
             "runbook_id": runbook_id,
@@ -199,8 +200,26 @@ def rebuild_knowledge_index():
             if not document.content:
                 continue
             metadata = document.metadata if isinstance(document.metadata, dict) else {}
+            try:
+                front_matter, _ = parse_front_matter(document.content)
+            except ValueError:
+                logger.warning('Could not parse front matter for knowledge document %s during rebuild', document.pk, exc_info=True)
+                front_matter = {}
+            metadata = {**metadata, **front_matter}
+            metadata['content_hash'] = content_fingerprint(document.content)
             source = metadata.get('source') or 'Manual Ingestion'
-            written = index_document(collection, document.pk, document.title, document.content, source, metadata=metadata, collection_id=document.collection_id)
+            document.title = str(metadata.get('title') or document.title)[:240]
+            document.metadata = metadata
+            document.save(update_fields=['title', 'metadata', 'updated_at'])
+            written = index_document(
+                collection,
+                document.pk,
+                document.title,
+                document.content,
+                source,
+                metadata=metadata,
+                collection_id=document.collection_id,
+            )
             if written:
                 count += 1
                 chunks += written
