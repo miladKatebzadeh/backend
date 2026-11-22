@@ -4,6 +4,8 @@ import time
 import urllib.error
 import urllib.request
 
+from apps.knowledge.ingestion import chunk_markdown, content_fingerprint, parse_front_matter
+
 logger = logging.getLogger(__name__)
 
 _collection = None
@@ -73,29 +75,8 @@ CHUNK_OVERLAP = 150
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split a runbook near a paragraph boundary so one vector is not the whole file."""
-    text = (text or "").strip()
-    if not text:
-        return []
-    if len(text) <= size:
-        return [text]
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + size)
-        if end < len(text):
-            window = text.rfind("\n", start + size // 2, end)
-            if window == -1:
-                window = text.rfind(" ", start + size // 2, end)
-            if window > start:
-                end = window
-        piece = text[start:end].strip()
-        if piece:
-            chunks.append(piece)
-        if end >= len(text):
-            break
-        start = max(end - overlap, start + 1)
-    return chunks
+    """Backward-compatible wrapper around the Markdown-aware chunker."""
+    return chunk_markdown(text, size=size, overlap=overlap)
 
 
 def delete_document_vectors(collection, document_id):
@@ -110,25 +91,77 @@ def delete_document_vectors(collection, document_id):
         logger.info("Chroma legacy delete skipped for document %s", document_id)
 
 
-def index_document(collection, document_id, title, content, source="Manual Ingestion"):
-    chunks = chunk_text(content)
+def index_document(
+    collection,
+    document_id,
+    title,
+    content,
+    source="Manual Ingestion",
+    metadata=None,
+    collection_id=None,
+):
+    """Index Markdown chunks with searchable runbook metadata."""
+    try:
+        front_matter, body = parse_front_matter(content)
+    except ValueError:
+        logger.exception("Invalid front matter while indexing document %s", document_id)
+        front_matter, body = {}, content or ""
+
+    document_metadata = {**front_matter, **(metadata or {})}
+    chunks = chunk_text(body)
     delete_document_vectors(collection, document_id)
     if not chunks:
         return 0
-    source = source or "Manual Ingestion"
-    collection.upsert(
-        ids=[f"{document_id}:{index}" for index in range(len(chunks))],
-        documents=chunks,
-        metadatas=[
-            {
-                "title": title or "runbook",
-                "source": source,
-                "document_id": str(document_id),
-                "chunk": index,
-            }
-            for index in range(len(chunks))
-        ],
-    )
+
+    source = source or document_metadata.get("source") or "Manual Ingestion"
+    keywords = document_metadata.get("keywords") or []
+    if isinstance(keywords, str):
+        keywords = [item.strip() for item in keywords.replace(";", ",").split(",") if item.strip()]
+    keywords_text = " ".join(str(item).strip() for item in keywords if str(item).strip())
+    section = str(document_metadata.get("section") or "").strip().lower()
+    component = str(document_metadata.get("component") or "").strip().lower()
+    runbook_id = str(document_metadata.get("id") or document_id)
+    content_hash = content_fingerprint(body)
+
+    ids = []
+    documents = []
+    metadatas = []
+    for index, chunk in enumerate(chunks):
+        context = [
+            f"Title: {title or document_metadata.get('title') or 'Runbook'}",
+            f"Section: {section}",
+            f"Component: {component}",
+            f"Keywords: {keywords_text}",
+        ]
+        documents.append("\n".join(item for item in context if item.strip()) + "\n\n" + chunk)
+        metadata_item = {
+            "title": str(title or document_metadata.get("title") or "runbook"),
+            "source": str(source),
+            "document_id": str(document_id),
+            "runbook_id": runbook_id,
+            "chunk": index,
+            "content_hash": content_hash,
+            "chunking_version": 2,
+        }
+        if section:
+            metadata_item["section"] = section
+        if component:
+            metadata_item["component"] = component
+        if keywords_text:
+            metadata_item["keywords"] = keywords_text
+        if collection_id is not None:
+            metadata_item["collection_id"] = int(collection_id)
+        headings = [
+            line.strip()
+            for line in chunk.splitlines()
+            if line.lstrip().startswith("#")
+        ]
+        if headings:
+            metadata_item["heading_path"] = " / ".join(headings[-4:])
+        ids.append(f"{document_id}:{index}")
+        metadatas.append(metadata_item)
+
+    collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
     return len(chunks)
 
 
@@ -166,7 +199,7 @@ def rebuild_knowledge_index():
                 continue
             metadata = document.metadata if isinstance(document.metadata, dict) else {}
             source = metadata.get('source') or 'Manual Ingestion'
-            written = index_document(collection, document.pk, document.title, document.content, source)
+            written = index_document(collection, document.pk, document.title, document.content, source, metadata=metadata, collection_id=document.collection_id)
             if written:
                 count += 1
                 chunks += written
