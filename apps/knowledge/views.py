@@ -6,7 +6,7 @@ from django.utils import timezone
 from rest_framework import decorators, response, viewsets
 
 from apps.audit.models import AuditEvent
-from apps.knowledge.chroma import get_chroma_collection
+from apps.knowledge.chroma import delete_document_vectors, get_chroma_collection, index_document
 from apps.knowledge.models import KnowledgeCollection, KnowledgeDocument
 from apps.knowledge.serializers import KnowledgeCollectionSerializer, KnowledgeDocumentSerializer
 
@@ -57,7 +57,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         collection = get_chroma_collection()
         if collection is not None:
             try:
-                collection.delete(ids=[str(document.pk)])
+                delete_document_vectors(collection, document.pk)
             except Exception:
                 logger.exception('Chroma delete failed')
         document.archived_at = timezone.now()
@@ -121,17 +121,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
             return False
         metadata = document.metadata if isinstance(document.metadata, dict) else {}
         source = source or metadata.get('source') or 'Manual Ingestion'
-        payload = {'title': document.title, 'source': source}
         try:
-            collection.upsert(ids=[str(document.pk)], documents=[document.content], metadatas=[payload])
-            return True
+            return index_document(collection, document.pk, document.title, document.content, source) > 0
         except Exception:
-            try:
-                collection.add(ids=[str(document.pk)], documents=[document.content], metadatas=[payload])
-                return True
-            except Exception:
-                logger.exception('Chroma index failed')
-                return False
+            logger.exception('Chroma index failed')
+            return False
 
     @decorators.action(detail=False, methods=['get'])
     def search(self, request):
@@ -143,7 +137,11 @@ class DocumentViewSet(viewsets.ModelViewSet):
         if collection is not None:
             try:
                 results = collection.query(query_texts=[query], n_results=10)
-                matched_ids = (results.get('ids') or [[]])[0]
+                matched_ids = []
+                for raw in (results.get('ids') or [[]])[0]:
+                    head = str(raw).split(':', 1)[0]
+                    if head.isdigit() and int(head) not in matched_ids:
+                        matched_ids.append(int(head))
                 if matched_ids:
                     matched = queryset.filter(pk__in=matched_ids)
                     return response.Response(self.get_serializer(matched, many=True).data)
