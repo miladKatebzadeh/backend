@@ -156,7 +156,7 @@ def _split_plain_text(text, size, overlap):
         next_start = max(0, cut - max(0, overlap))
         while next_start < cut and next_start > 0 and not remaining[next_start - 1].isspace():
             next_start += 1
-        if next_start >= cut:
+        if next_start <= 0 or next_start >= cut:
             next_start = cut
         remaining = remaining[next_start:].strip()
     if remaining:
