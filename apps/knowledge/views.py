@@ -3,10 +3,13 @@ import logging
 import uuid
 
 from django.utils import timezone
+from django.utils.text import slugify
 from rest_framework import decorators, response, viewsets
 
 from apps.audit.models import AuditEvent
 from apps.knowledge.chroma import delete_document_vectors, get_chroma_collection, index_document
+from apps.knowledge.ingestion import content_fingerprint, parse_front_matter
+from apps.knowledge.retrieval import retrieve_runbooks
 from apps.knowledge.models import KnowledgeCollection, KnowledgeDocument
 from apps.knowledge.serializers import KnowledgeCollectionSerializer, KnowledgeDocumentSerializer
 
@@ -67,7 +70,21 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
     def perform_update(self, serializer):
         document = serializer.save()
-        self._index(document)
+        metadata = document.metadata if isinstance(document.metadata, dict) else {}
+        try:
+            front_matter, _ = parse_front_matter(document.content)
+        except ValueError:
+            logger.exception("Invalid YAML front matter in updated knowledge document %s", document.pk)
+            front_matter = {}
+        source = metadata.get("source") or "Manual Ingestion"
+        document.metadata = {
+            **metadata,
+            **front_matter,
+            "source": source,
+            "content_hash": content_fingerprint(document.content),
+        }
+        document.save(update_fields=["metadata", "updated_at"])
+        self._index(document, source)
 
     def create(self, request, *args, **kwargs):
         uploaded_file = request.FILES.get('file')
@@ -87,11 +104,27 @@ class DocumentViewSet(viewsets.ModelViewSet):
             else:
                 file_content = raw_bytes.decode('utf-8', errors='ignore')
 
-        title = _clean(request.data.get('title') or file_name or 'Untitled Runbook')
         content = _clean(request.data.get('content') or file_content)
-        source = _clean(request.data.get('source') or 'Manual Ingestion') or 'Manual Ingestion'
         if not content:
             return response.Response({'detail': 'Unable to extract any valid text content.'}, status=400)
+
+        try:
+            front_matter, _ = parse_front_matter(content)
+        except ValueError as exc:
+            return response.Response({'detail': str(exc)}, status=400)
+
+        title = _clean(
+            request.data.get('title')
+            or front_matter.get('title')
+            or file_name
+            or 'Untitled Runbook'
+        )
+        source = _clean(request.data.get('source') or 'Manual Ingestion') or 'Manual Ingestion'
+        document_metadata = {
+            **front_matter,
+            'source': source,
+            'content_hash': content_fingerprint(content),
+        }
 
         collection = KnowledgeCollection.objects.filter(archived_at__isnull=True).first()
         if collection is None:
@@ -100,32 +133,84 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 description='Global Ops Knowledge Base',
                 provider='chromadb',
             )
+
+        runbook_id = str(front_matter.get('id') or '').strip()
+        external_id = (
+            f"runbook_{slugify(runbook_id)[:160]}"
+            if runbook_id
+            else f'ext_{uuid.uuid4().hex[:12]}'
+        )
+        document = KnowledgeDocument.objects.filter(
+            collection=collection,
+            external_id=external_id,
+            archived_at__isnull=True,
+        ).first()
+        if document is None:
+            document = KnowledgeDocument.objects.filter(
+                collection=collection,
+                archived_at__isnull=True,
+                metadata__content_hash=document_metadata['content_hash'],
+            ).first()
+
+        if document is not None:
+            document.title = title
+            document.content = content
+            document.metadata = document_metadata
+            document.save(update_fields=['title', 'content', 'metadata', 'updated_at'])
+            indexed_chunks = self._index(document, source)
+            AuditEvent.objects.create(
+                action='update',
+                resource_type='document',
+                resource_id=str(document.pk),
+                payload={'title': title, 'reason': 'idempotent knowledge ingestion'},
+            )
+            payload = self.get_serializer(document).data
+            payload['indexed'] = bool(indexed_chunks)
+            payload['indexed_chunks'] = indexed_chunks
+            payload['updated_existing'] = True
+            return response.Response(payload, status=200)
+
         serializer = self.get_serializer(data={
             'title': title,
             'content': content,
-            'external_id': f'ext_{uuid.uuid4().hex[:12]}',
+            'external_id': external_id,
             'collection': collection.pk,
-            'metadata': {'source': source},
+            'metadata': document_metadata,
         })
         serializer.is_valid(raise_exception=True)
         document = serializer.save()
-        indexed = self._index(document, source)
-        AuditEvent.objects.create(action='create', resource_type='document', resource_id=str(document.pk), payload={'title': title})
+        indexed_chunks = self._index(document, source)
+        AuditEvent.objects.create(
+            action='create',
+            resource_type='document',
+            resource_id=str(document.pk),
+            payload={'title': title},
+        )
         payload = self.get_serializer(document).data
-        payload['indexed'] = indexed
+        payload['indexed'] = bool(indexed_chunks)
+        payload['indexed_chunks'] = indexed_chunks
+        payload['updated_existing'] = False
         return response.Response(payload, status=201)
 
     def _index(self, document, source=None):
         collection = get_chroma_collection()
         if collection is None or not document.content:
-            return False
+            return 0
         metadata = document.metadata if isinstance(document.metadata, dict) else {}
         source = source or metadata.get('source') or 'Manual Ingestion'
         try:
-            return index_document(collection, document.pk, document.title, document.content, source) > 0
+            return index_document(
+                collection,
+                document.pk,
+                document.title,
+                document.content,
+                source,
+                metadata=metadata,
+                collection_id=document.collection_id,
+            )
         except Exception:
             logger.exception('Chroma index failed')
-            return False
+            return 0
 
     @decorators.action(detail=False, methods=['get'])
     def search(self, request):
@@ -133,22 +218,19 @@ class DocumentViewSet(viewsets.ModelViewSet):
         queryset = self.get_queryset()
         if not query:
             return response.Response(self.get_serializer(queryset[:50], many=True).data)
-        collection = get_chroma_collection()
-        if collection is not None:
-            try:
-                results = collection.query(query_texts=[query], n_results=10)
-                matched_ids = []
-                for raw in (results.get('ids') or [[]])[0]:
-                    head = str(raw).split(':', 1)[0]
-                    if head.isdigit() and int(head) not in matched_ids:
-                        matched_ids.append(int(head))
-                if matched_ids:
-                    matched = queryset.filter(pk__in=matched_ids)
-                    return response.Response(self.get_serializer(matched, many=True).data)
-            except Exception:
-                logger.exception('vector search failed')
-        matched = queryset.filter(title__icontains=query) | queryset.filter(content__icontains=query)
-        return response.Response(self.get_serializer(matched[:50], many=True).data)
+
+        retrieval = retrieve_runbooks(query, limit=50)
+        matched_ids = []
+        for hit in retrieval.get('results', []):
+            document_id = hit.get('document_id')
+            if document_id is not None and document_id not in matched_ids:
+                matched_ids.append(document_id)
+
+        if not matched_ids:
+            return response.Response([])
+        found = {row.pk: row for row in queryset.filter(pk__in=matched_ids)}
+        ordered = [found[document_id] for document_id in matched_ids if document_id in found]
+        return response.Response(self.get_serializer(ordered, many=True).data)
 
 
 @decorators.api_view(['GET'])
