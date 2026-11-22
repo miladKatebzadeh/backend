@@ -153,6 +153,7 @@ def _chroma_candidates(collection, query, incident_family, limit):
             return []
         n_results = min(int(count), max(12, limit * 8))
         where = _family_filter(incident_family)
+        candidates = []
         if where:
             try:
                 filtered = collection.query(
@@ -160,14 +161,15 @@ def _chroma_candidates(collection, query, incident_family, limit):
                     n_results=n_results,
                     where=where,
                 )
-                candidates = _candidate_from_chroma(filtered)
-                if candidates:
-                    return candidates
+                candidates.extend(_candidate_from_chroma(filtered))
             except Exception:
-                logger.info("Chroma metadata-filtered retrieval unavailable; using unfiltered retrieval.", exc_info=True)
+                logger.info("Chroma metadata-filtered retrieval unavailable; continuing with unfiltered retrieval.", exc_info=True)
 
+        # Keep unfiltered retrieval in the candidate pool for older vectors that
+        # predate front matter metadata and for metadata that is incomplete.
         results = collection.query(query_texts=[query], n_results=n_results)
-        return _candidate_from_chroma(results)
+        candidates.extend(_candidate_from_chroma(results))
+        return candidates
     except Exception:
         logger.exception("Chroma retrieval failed")
         return []
