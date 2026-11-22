@@ -202,11 +202,12 @@ def _postgres_candidates(query, limit=80):
         except ValueError:
             logger.warning("Skipping front matter parsing for legacy document %s", row.pk, exc_info=True)
             front_matter, body = {}, row.content
-        metadata = {**front_matter, **metadata}
+        metadata = {**metadata, **front_matter}
+        display_title = str(metadata.get("title") or row.title)
         chunks = chunk_markdown(body)
         for index, chunk in enumerate(chunks):
             prefix = [
-                f"Title: {row.title}",
+                f"Title: {display_title}",
                 f"Section: {metadata.get('section', '')}",
                 f"Component: {metadata.get('component', '')}",
                 f"Keywords: {', '.join(metadata.get('keywords', [])) if isinstance(metadata.get('keywords'), list) else metadata.get('keywords', '')}",
@@ -214,7 +215,7 @@ def _postgres_candidates(query, limit=80):
             text = "\n".join(item for item in prefix if item.strip()) + "\n\n" + chunk
             candidates.append({
                 "text": text,
-                "title": row.title,
+                "title": display_title,
                 "document_id": row.pk,
                 "chunk": index,
                 "section": str(metadata.get("section") or ""),
