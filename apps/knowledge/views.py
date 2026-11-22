@@ -148,6 +148,13 @@ class DocumentViewSet(viewsets.ModelViewSet):
             external_id=external_id,
             archived_at__isnull=True,
         ).first()
+        if document is None and runbook_id:
+            document = KnowledgeDocument.objects.filter(
+                collection=collection,
+                archived_at__isnull=True,
+                metadata__id=runbook_id,
+            ).first()
+
         if document is None:
             document = KnowledgeDocument.objects.filter(
                 collection=collection,
