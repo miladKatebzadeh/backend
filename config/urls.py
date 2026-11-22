@@ -7,4 +7,5 @@ urlpatterns = [
     path('api/mcp/', include('apps.mcp.urls')),
     path('api/knowledge/', include('apps.knowledge.urls')),
     path('api/audit/', include('apps.audit.urls')),
+    path('api/incidents/', include('apps.incidents.urls')),
 ]
