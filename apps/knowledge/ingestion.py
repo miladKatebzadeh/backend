@@ -227,8 +227,9 @@ def chunk_markdown(text, size=1000, overlap=150):
             prefix = ""
 
         current = []
+        block_size = max(128, size - len(prefix) - 2) if prefix else size
         for block in blocks:
-            parts = _split_large_block(block, size, overlap)
+            parts = _split_large_block(block, block_size, overlap)
             for part in parts:
                 candidate = "\n\n".join([*current, part]).strip()
                 rendered = f"{prefix}\n\n{candidate}".strip() if prefix else candidate
