@@ -5,6 +5,7 @@ import uuid
 from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import decorators, response, viewsets
+from rest_framework.exceptions import ValidationError
 
 from apps.audit.models import AuditEvent
 from apps.knowledge.chroma import delete_document_vectors, get_chroma_collection, index_document
@@ -69,13 +70,14 @@ class DocumentViewSet(viewsets.ModelViewSet):
         return response.Response(status=204)
 
     def perform_update(self, serializer):
+        content = serializer.validated_data.get("content", serializer.instance.content)
+        try:
+            front_matter, _ = parse_front_matter(content)
+        except ValueError as exc:
+            raise ValidationError({"content": str(exc)}) from exc
+
         document = serializer.save()
         metadata = document.metadata if isinstance(document.metadata, dict) else {}
-        try:
-            front_matter, _ = parse_front_matter(document.content)
-        except ValueError:
-            logger.exception("Invalid YAML front matter in updated knowledge document %s", document.pk)
-            front_matter = {}
         source = metadata.get("source") or "Manual Ingestion"
         document.metadata = {
             **metadata,
