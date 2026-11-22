@@ -339,7 +339,7 @@ class StandaloneCollectorDaemon:
                 alerts = (response.json().get('data') or {}).get('alerts') or []
                 if not isinstance(alerts, list):
                     raise ValueError('Prometheus returned an invalid alerts payload')
-                successful_sources.add('prometheus_alert')
+                parsed_alerts = []
                 for item in alerts:
                     state = str(item.get('state') or '').lower()
                     if state not in ('firing', 'pending'):
@@ -350,7 +350,9 @@ class StandaloneCollectorDaemon:
                         value = float(item.get('value') or 0)
                     except (TypeError, ValueError):
                         value = 0
-                    found.append((f'alert:{name}', value, labels, 'FIRING' if state == 'firing' else 'PENDING', 'prometheus_alert'))
+                    parsed_alerts.append((f'alert:{name}', value, labels, 'FIRING' if state == 'firing' else 'PENDING', 'prometheus_alert'))
+                found.extend(parsed_alerts)
+                successful_sources.add('prometheus_alert')
             except Exception as exc:
                 logger.error('Prometheus alerts failed: %s', exc)
 
@@ -362,13 +364,15 @@ class StandaloneCollectorDaemon:
                 body = response.json()
                 if not isinstance(body, list):
                     raise ValueError('Alertmanager returned an invalid alerts payload')
-                successful_sources.add('alertmanager')
+                parsed_alerts = []
                 for item in body:
                     labels = item.get('labels') or {}
                     name = str(labels.get('alertname') or 'alertmanager')
                     state = str((item.get('status') or {}).get('state') or 'active').lower()
                     status = 'FIRING' if state in ('active', 'firing') else 'PENDING'
-                    found.append((f'alert:{name}', 1, labels, status, 'alertmanager'))
+                    parsed_alerts.append((f'alert:{name}', 1, labels, status, 'alertmanager'))
+                found.extend(parsed_alerts)
+                successful_sources.add('alertmanager')
             except Exception as exc:
                 logger.error('Alertmanager collection failed: %s', exc)
 
