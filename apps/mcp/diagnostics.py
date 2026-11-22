@@ -13,7 +13,7 @@ from django.utils import timezone
 from django.utils.text import slugify
 
 from apps.collector.models import DockerMetric, JenkinsBuild, PrometheusAlert
-from apps.knowledge.chroma import get_chroma_collection
+from apps.knowledge.retrieval import retrieve_runbooks
 from apps.mcp.models import MCPTool, get_setting
 from apps.mcp.runtime import MCPSandboxExecutor
 
@@ -653,67 +653,14 @@ def gather(decisions: dict) -> dict:
     return payload
 
 
-def _chroma_hits(collection, query):
-    try:
-        return collection.query(query_texts=[query], n_results=3)
-    except Exception:
-        logger.exception('Chroma query failed')
-        return None
-
-
-def _format_hits(results):
-    documents = []
-    groups = results.get('documents') or []
-    distances = results.get('distances') or []
-    metadatas = results.get('metadatas') or []
-    ids = results.get('ids') or []
-    for index, group in enumerate(groups):
-        dist_group = distances[index] if index < len(distances) else []
-        meta_group = metadatas[index] if index < len(metadatas) else []
-        id_group = ids[index] if index < len(ids) else []
-        for item_index, doc in enumerate(group or []):
-            if not isinstance(doc, str) or not doc.strip():
-                continue
-            distance = dist_group[item_index] if item_index < len(dist_group) else None
-            try:
-                too_far = distance is not None and float(distance) > 1.5
-            except (TypeError, ValueError):
-                too_far = False
-            if too_far:
-                continue
-            meta = meta_group[item_index] if item_index < len(meta_group) and isinstance(meta_group[item_index], dict) else {}
-            label = meta.get('title') or (id_group[item_index] if item_index < len(id_group) else 'runbook')
-            documents.append(f'[{label}] {doc[:1500]}')
-    return documents
-
-
-def _postgres_hits(query):
-    from apps.knowledge.models import KnowledgeDocument
-    words = []
-    for word in (query or '').replace('_', ' ').split():
-        cleaned = ''.join(character for character in word if character.isalnum())
-        if len(cleaned) >= 4 and cleaned.lower() not in words:
-            words.append(cleaned.lower())
-        if len(words) == 6:
-            break
-    if not words:
-        return []
-    condition = Q()
-    for word in words:
-        condition |= Q(title__icontains=word) | Q(content__icontains=word)
-    rows = KnowledgeDocument.objects.filter(archived_at__isnull=True).filter(condition).order_by('-updated_at')[:3]
-    return [f'[{row.title}] {row.content[:1500]}' for row in rows]
-
-
-def retrieve(query: str) -> list:
-    collection = get_chroma_collection()
-    if collection is not None:
-        results = _chroma_hits(collection, query)
-        if results:
-            documents = _format_hits(results)
-            if documents:
-                return documents
-    return _postgres_hits(query)
+def retrieve(query: str, decisions=None, limit=3) -> dict:
+    """Retrieve relevant runbook chunks and report their provenance."""
+    decisions = decisions if isinstance(decisions, dict) else {}
+    return retrieve_runbooks(
+        query,
+        incident_family=decisions.get('incident_family'),
+        limit=limit,
+    )
 
 
 def _model_evidence(evidence):
@@ -907,6 +854,7 @@ def diagnose(user_message: str, allow_remediation: bool = False) -> dict:
     decisions = {}
     evidence = {}
     documents = []
+    retrieval = {'results': [], 'source': 'none', 'candidate_count': 0, 'filters': []}
     query = ''
     route_view = {}
     engine_status = 'ok'
@@ -927,14 +875,34 @@ def diagnose(user_message: str, allow_remediation: bool = False) -> dict:
             }
             _set_output(laya_span, route_view)
         query = runbook_query(decisions, user_message)
-        with _child_span(langfuse, 'chromadb', {
+        with _child_span(langfuse, 'runbook_retrieval', {
             'query': query,
             'section': decisions.get('incident_family', 'unknown'),
-        }, parent=parent) as chroma_span:
-            documents = retrieve(query)
-            _set_output(chroma_span, {
+        }, parent=parent) as retrieval_span:
+            retrieval = retrieve(query, decisions)
+            hits = retrieval.get('results', [])
+            documents = [hit['text'] for hit in hits]
+            _set_output(retrieval_span, {
                 'section': decisions.get('incident_family', 'unknown'),
                 'query': query,
+                'retrieval_source': retrieval.get('source'),
+                'candidate_count': retrieval.get('candidate_count'),
+                'filters': retrieval.get('filters'),
+                'hits': [
+                    {
+                        'title': hit.get('title'),
+                        'document_id': hit.get('document_id'),
+                        'section': hit.get('section'),
+                        'component': hit.get('component'),
+                        'chunk': hit.get('chunk'),
+                        'distance': hit.get('distance'),
+                        'lexical_score': hit.get('lexical_score'),
+                        'relevance_score': hit.get('relevance_score'),
+                        'matched_terms': hit.get('matched_terms'),
+                        'retrieval_source': hit.get('retrieval_source'),
+                    }
+                    for hit in hits
+                ],
                 'runbooks': [_compact(document, 1000) for document in documents[:3]],
             })
         try:
@@ -967,6 +935,7 @@ TOOLS:
 You are the Revive diagnostics engine.
 The user message has the error, the section chosen by routing, the runbook, and the active tools.
 Use only those. If a claim is not supported by them, say you do not know.
+RUNBOOK entries are ranked candidates, not proof by themselves. Use a runbook only when its actual symptom, component, and failure mechanism match this incident. A shared platform name such as Docker is not enough to make a runbook relevant. If no retrieved runbook addresses the reported symptom, state that runbook evidence is insufficient.
 Choose at most one tool. tool_name must be an exact name from TOOLS, or an empty string if none should run.
 tool_target is the resource that tool should act on, copied from the error, or an empty string.
 Do not invent a tool name. Do not claim a tool has already run.
@@ -1009,8 +978,25 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
         _close_trace(handle, {
             'engine_status': engine_status,
             'laya': route_view,
-            'chromadb': {
+            'runbook_retrieval': {
                 'query': query,
+                'retrieval_source': retrieval.get('source'),
+                'candidate_count': retrieval.get('candidate_count'),
+                'filters': retrieval.get('filters'),
+                'hits': [
+                    {
+                        'title': hit.get('title'),
+                        'document_id': hit.get('document_id'),
+                        'section': hit.get('section'),
+                        'component': hit.get('component'),
+                        'distance': hit.get('distance'),
+                        'lexical_score': hit.get('lexical_score'),
+                        'relevance_score': hit.get('relevance_score'),
+                        'matched_terms': hit.get('matched_terms'),
+                        'retrieval_source': hit.get('retrieval_source'),
+                    }
+                    for hit in retrieval.get('results', [])
+                ],
                 'runbooks': [_compact(document, 1000) for document in documents[:3]],
             },
             'reply': _compact(reply_text, 4000),
