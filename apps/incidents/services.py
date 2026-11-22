@@ -1,11 +1,13 @@
 import hashlib
 import json
+from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
 
 from apps.collector.models import DockerMetric, JenkinsBuild, PrometheusAlert
 from apps.incidents.models import Incident, IncidentEvent
+from apps.mcp.models import get_setting
 
 
 def incident_fingerprint(source: str, resource: str, condition: str) -> str:
@@ -148,6 +150,15 @@ def _excerpt(value, limit=2000):
     return str(value or '')[-limit:]
 
 
+def _telemetry_cutoff():
+    try:
+        interval = int(get_setting('scrape_interval', '15'))
+    except (TypeError, ValueError):
+        interval = 15
+    interval = max(5, min(interval, 3600))
+    return timezone.now() - timedelta(seconds=max(60, interval * 3))
+
+
 def sync_incidents_from_telemetry() -> dict:
     """
     Synchronize persisted source signals into the incident ledger.
@@ -157,9 +168,12 @@ def sync_incidents_from_telemetry() -> dict:
     restart/OOM evidence raises it; 'dead' and OOM-killed are critical.
     """
     summary = {'active': 0, 'resolved': 0}
+    cutoff = _telemetry_cutoff()
 
+    # Ignore old samples. A collector outage must not make stale data look
+    # current or automatically resolve an incident.
     docker_rows = _latest_by(
-        DockerMetric.objects.all(),
+        DockerMetric.objects.filter(timestamp__gte=cutoff),
         lambda row: row.container_name,
         ('-timestamp', '-id'),
     )
@@ -203,7 +217,7 @@ def sync_incidents_from_telemetry() -> dict:
         summary['active'] += 1
 
     jenkins_rows = _latest_by(
-        JenkinsBuild.objects.all(),
+        JenkinsBuild.objects.filter(updated_at__gte=cutoff),
         lambda row: row.job_name,
         ('-build_number', '-updated_at', '-id'),
     )
@@ -246,7 +260,7 @@ def sync_incidents_from_telemetry() -> dict:
         summary['active'] += 1
 
     prometheus_rows = _latest_by(
-        PrometheusAlert.objects.all(),
+        PrometheusAlert.objects.filter(updated_at__gte=cutoff),
         lambda row: (row.metric_type, row.metric_name),
         ('-updated_at', '-id'),
     )
