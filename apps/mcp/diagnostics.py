@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from contextlib import contextmanager
@@ -78,16 +79,28 @@ def _retire_laya(reason):
 
 
 def _probe_laya(model):
+    """Warm both English and Persian routing checkpoints before enabling Laya."""
     predict = getattr(model, 'predict', None)
     if not callable(predict):
         return model
-    try:
-        result = _within(lambda: predict({'message': 'ping', 'snapshot': ''}, LAYA_QUESTIONS), _laya_timeout())
-    except Exception:
-        logger.exception('Laya probe failed')
-        return None
-    if result is _TimedOut or not isinstance(result, dict):
-        return None
+
+    probes = (
+        ('English', 'ping'),
+        ('Persian', 'این یک پیام آزمایشی برای تشخیص نوع مشکل زیرساختی است.'),
+    )
+    for language, message in probes:
+        state = {'message': message, 'snapshot': ''}
+        try:
+            result = _within(lambda: predict(state, LAYA_QUESTIONS), _laya_timeout())
+        except Exception:
+            logger.exception('Laya %s startup probe failed', language)
+            return None
+        if result is _TimedOut:
+            logger.warning('Laya %s startup probe timed out.', language)
+            return None
+        if not isinstance(result, dict):
+            logger.warning('Laya %s startup probe returned an invalid response.', language)
+            return None
     return model
 
 
@@ -339,45 +352,165 @@ def _set_output(span, output):
 
 
 
+ROUTING_KEYWORDS = {
+    'ci_failure': (
+        'jenkins', 'build', 'pipeline', 'compile', 'workflow', 'ci',
+        'جنکینز', 'بیلد', 'پایپ لاین', 'خط لوله', 'کامپایل', 'فرایند ساخت',
+    ),
+    'metric_anomaly': (
+        'cpu', 'memory', 'ram', 'prometheus', 'metric', 'disk', 'latency',
+        'حافظه', 'رم', 'پردازنده', 'دیسک', 'فضای دیسک', 'پرومتئوس', 'متریک',
+    ),
+    'container_runtime': (
+        'docker', 'container', 'crash', 'restart', 'restarted', 'restarting',
+        'exited', 'oom', 'killed', 'کانتینر', 'داکر', 'کرش', 'ریستارت',
+        'متوقف شد', 'خارج شد', 'کشته شد',
+    ),
+    'deployment_regression': (
+        'deploy', 'deployed', 'deployment', 'release', 'rollout', 'commit',
+        'استقرار', 'انتشار', 'رول اوت', 'نسخه جدید', 'کامیت', 'دیپلوی',
+    ),
+}
+
+_FAMILY_FLAGS = {
+    'ci_failure': 'need_ci_logs',
+    'metric_anomaly': 'need_metric_window',
+    'container_runtime': 'need_container_events',
+    'deployment_regression': 'need_deployment_changes',
+}
+_FAMILY_ALIASES = {
+    'ci': 'ci_failure',
+    'jenkins': 'ci_failure',
+    'pipeline_failure': 'ci_failure',
+    'metric': 'metric_anomaly',
+    'metrics': 'metric_anomaly',
+    'container': 'container_runtime',
+    'docker': 'container_runtime',
+    'deployment': 'deployment_regression',
+    'deploy': 'deployment_regression',
+    'release': 'deployment_regression',
+    'rollout': 'deployment_regression',
+}
+
+
+def _normalise_routing_text(value):
+    text = str(value or '').lower()
+    text = text.replace('ي', 'ی').replace('ك', 'ک').replace('\u200c', ' ')
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _contains_routing_keyword(text, keyword):
+    if keyword.isascii() and keyword.isalnum():
+        return re.search(rf'(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])', text) is not None
+    return keyword in text
+
+
+def _canonical_family(value):
+    family = re.sub(r'[\s-]+', '_', str(value or '').strip().lower())
+    family = _FAMILY_ALIASES.get(family, family)
+    return family if family in (*_FAMILY_FLAGS.keys(), 'unknown') else 'unknown'
+
+
 def keyword_decisions(user_message: str) -> dict:
-    text = (user_message or '').lower()
+    text = _normalise_routing_text(user_message)
+    scores = {
+        family: sum(1 for keyword in keywords if _contains_routing_keyword(text, keyword))
+        for family, keywords in ROUTING_KEYWORDS.items()
+    }
     decisions = {
         'incident_family': 'unknown',
-        'need_ci_logs': any(word in text for word in ('jenkins', 'build', 'pipeline', 'compile')),
-        'need_metric_window': any(word in text for word in ('cpu', 'memory', 'prometheus', 'metric', 'disk')),
-        'need_container_events': any(word in text for word in ('docker', 'container', 'crash', 'restart', 'exited')),
-        'need_deployment_changes': any(word in text for word in ('deploy', 'commit', 'release', 'rollout')),
+        'need_ci_logs': scores['ci_failure'] > 0,
+        'need_metric_window': scores['metric_anomaly'] > 0,
+        'need_container_events': scores['container_runtime'] > 0,
+        'need_deployment_changes': scores['deployment_regression'] > 0,
         'need_runbook_search': True,
     }
-    if not any((decisions['need_ci_logs'], decisions['need_metric_window'], decisions['need_container_events'])):
-        decisions['need_container_events'] = True
-    if decisions['need_container_events']:
-        decisions['incident_family'] = 'container_runtime'
-    elif decisions['need_ci_logs']:
-        decisions['incident_family'] = 'ci_failure'
-    elif decisions['need_metric_window']:
-        decisions['incident_family'] = 'metric_anomaly'
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if ranked and ranked[0][1] > 0:
+        second_score = ranked[1][1] if len(ranked) > 1 else 0
+        if ranked[0][1] > second_score:
+            decisions['incident_family'] = ranked[0][0]
     return align_section(decisions)
 
 
 LAYA_QUESTIONS = {
     'incident_family': {
         'type': 'choice',
-        'instructions': 'Which infrastructure family does this anomaly belong to?',
+        'instructions': (
+            'Choose exactly one infrastructure family using the user message and supplied snapshot. '
+            'Use unknown when the evidence is insufficient, mixed, or does not fit a listed family. '
+            'Do not guess a family merely because one is common.'
+        ),
         'criteria': {
-            'ci_failure': 'Jenkins or CI build, compile, or pipeline failure',
-            'metric_anomaly': 'CPU, memory, disk, or Prometheus metric problem',
-            'container_runtime': 'Docker container crash, restart, or exit',
-            'deployment_regression': 'Deploy, release, or rollout regression',
-            'unknown': 'None of the above',
+            'ci_failure': 'Jenkins, CI job, build, compile, workflow, or pipeline failure; for example بیلد جنکینز شکست خورد',
+            'metric_anomaly': 'CPU, memory/RAM, disk, latency, or Prometheus metric anomaly; for example مصرف CPU بالا است',
+            'container_runtime': 'Docker/container crash, restart, OOM kill, or exit; for example کانتینر متوقف شد',
+            'deployment_regression': 'A regression after deploy, release, rollout, or commit; for example بعد از استقرار نسخه جدید سرویس خراب شد',
+            'unknown': 'Insufficient or conflicting evidence, or a problem outside the listed infrastructure families',
         },
     },
-    'need_ci_logs': {'type': 'noul', 'instructions': 'Are CI or Jenkins logs required to diagnose this?'},
-    'need_metric_window': {'type': 'noul', 'instructions': 'Are Prometheus or host metrics required?'},
-    'need_container_events': {'type': 'noul', 'instructions': 'Are Docker container events required?'},
-    'need_deployment_changes': {'type': 'noul', 'instructions': 'Are deployment or release changes required?'},
-    'need_runbook_search': {'type': 'noul', 'instructions': 'Should a runbook be searched?'},
+    'need_ci_logs': {
+        'type': 'noul',
+        'instructions': 'Return true only when Jenkins, CI, build, compile, workflow, or pipeline logs are relevant to this incident. Otherwise return false.',
+    },
+    'need_metric_window': {
+        'type': 'noul',
+        'instructions': 'Return true only when CPU, memory, disk, latency, Prometheus, or host metric evidence is relevant. Otherwise return false.',
+    },
+    'need_container_events': {
+        'type': 'noul',
+        'instructions': 'Return true only when Docker/container state, lifecycle events, restarts, OOM kills, or container logs are relevant. Otherwise return false.',
+    },
+    'need_deployment_changes': {
+        'type': 'noul',
+        'instructions': 'Return true only when deploy, release, rollout, commit, or version-change evidence is relevant. Otherwise return false.',
+    },
+    'need_runbook_search': {
+        'type': 'noul',
+        'instructions': 'Runbook retrieval is always enabled by the application; return true.',
+    },
 }
+
+
+def _laya_confidence_threshold():
+    default = 0.35
+    try:
+        threshold = float(os.getenv('OPSHUB_LAYA_CONFIDENCE_THRESHOLD', str(default)))
+    except (TypeError, ValueError):
+        return default
+    return threshold if 0.0 <= threshold <= 1.0 else default
+
+
+def _laya_boolean(target, threshold):
+    true_values = ('true', 'yes', '1')
+    false_values = ('false', 'no', '0', 'none', '')
+    if isinstance(target, dict):
+        choice = target.get('choice')
+        if isinstance(choice, bool):
+            return choice
+        choice_text = str(choice or '').strip().lower()
+        if choice_text in true_values:
+            return True
+        if choice_text in false_values:
+            return False
+        raw = target.get('noul', target.get('probability_true', target.get('probability')))
+    else:
+        if isinstance(target, bool):
+            return target
+        raw = target
+
+    if isinstance(raw, str):
+        raw_text = raw.strip().lower()
+        if raw_text in true_values:
+            return True
+        if raw_text in false_values:
+            return False
+    try:
+        probability = float(raw)
+    except (TypeError, ValueError):
+        return False
+    return 0.0 <= probability <= 1.0 and probability >= threshold
 
 
 def route(user_message: str, context: dict) -> dict:
@@ -386,7 +519,11 @@ def route(user_message: str, context: dict) -> dict:
         decisions = keyword_decisions(user_message)
         decisions['router'] = 'keywords'
         return decisions
-    state = {'message': user_message, 'snapshot': context.get('fleet_anomaly_snapshot', '')}
+
+    state = {
+        'message': user_message,
+        'snapshot': context.get('fleet_anomaly_snapshot', '') if isinstance(context, dict) else '',
+    }
     try:
         result = _within(lambda: model.predict(state, LAYA_QUESTIONS), _laya_timeout())
     except Exception:
@@ -398,50 +535,33 @@ def route(user_message: str, context: dict) -> dict:
         decisions['router'] = 'keywords'
         return decisions
 
-    answers = result.get('answers') if isinstance(result, dict) else None
+    answers = result.get('answers')
     if not isinstance(answers, dict):
-        answers = result if isinstance(result, dict) else {}
-
-    def as_bool(key):
-        target = answers.get(key, {})
-        if isinstance(target, dict):
-            raw = target.get('noul', target.get('probability_true', target.get('probability', 0)))
-            try:
-                probability = float(raw or 0)
-            except (TypeError, ValueError):
-                probability = 0
-            return probability > 0.15 or str(target.get('choice', '')).lower() in ('true', 'yes', '1')
-        return str(target).lower() in ('true', 'yes', '1')
+        answers = result
 
     family = answers.get('incident_family', {})
     if isinstance(family, dict):
         family = family.get('choice', 'unknown')
     decisions = {
         'router': 'laya',
-        'incident_family': str(family or 'unknown'),
-        'need_ci_logs': as_bool('need_ci_logs'),
-        'need_metric_window': as_bool('need_metric_window'),
-        'need_container_events': as_bool('need_container_events'),
-        'need_deployment_changes': as_bool('need_deployment_changes'),
-        'need_runbook_search': as_bool('need_runbook_search'),
+        'incident_family': _canonical_family(family),
+        'need_ci_logs': _laya_boolean(answers.get('need_ci_logs'), _laya_confidence_threshold()),
+        'need_metric_window': _laya_boolean(answers.get('need_metric_window'), _laya_confidence_threshold()),
+        'need_container_events': _laya_boolean(answers.get('need_container_events'), _laya_confidence_threshold()),
+        'need_deployment_changes': _laya_boolean(answers.get('need_deployment_changes'), _laya_confidence_threshold()),
+        'need_runbook_search': True,
     }
-    routing = result.get('routing') if isinstance(result, dict) else None
+    routing = result.get('routing')
     if isinstance(routing, dict) and routing.get('model'):
         decisions['laya_model'] = str(routing['model'])
-    if not any((decisions['need_ci_logs'], decisions['need_metric_window'], decisions['need_container_events'])):
-        decisions['need_container_events'] = True
     return align_section(decisions)
 
 
 def align_section(decisions):
-    """The section Laya picked decides which error data and which runbook to load."""
-    family = str(decisions.get('incident_family') or 'unknown')
-    section_flag = {
-        'ci_failure': 'need_ci_logs',
-        'metric_anomaly': 'need_metric_window',
-        'container_runtime': 'need_container_events',
-        'deployment_regression': 'need_deployment_changes',
-    }.get(family)
+    """Align the selected family with the evidence section that must be gathered."""
+    family = _canonical_family(decisions.get('incident_family'))
+    decisions['incident_family'] = family
+    section_flag = _FAMILY_FLAGS.get(family)
     if section_flag:
         decisions[section_flag] = True
     decisions['need_runbook_search'] = True
