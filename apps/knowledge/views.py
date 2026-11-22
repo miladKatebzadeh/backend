@@ -87,6 +87,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         document.metadata = {
             **preserved_metadata,
             **front_matter,
+            "title": document.title,
             "source": source,
             "content_hash": content_fingerprint(document.content),
         }
@@ -129,6 +130,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         source = _clean(request.data.get('source') or 'Manual Ingestion') or 'Manual Ingestion'
         document_metadata = {
             **front_matter,
+            'title': title,
             'source': source,
             'content_hash': content_fingerprint(content),
         }
