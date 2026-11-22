@@ -41,6 +41,7 @@ _SYNONYMS = {
     "crashed": {"crash", "crashed", "exited", "terminated", "dead"},
     "failure": {"failure", "failed", "fail", "broken"},
     "failed": {"failure", "failed", "fail", "broken"},
+    "fail": {"failure", "failed", "fail", "broken"},
     "rollback": {"rollback", "revert", "previous", "restore"},
 }
 
@@ -252,6 +253,7 @@ def _score_candidate(candidate, query_terms, incident_family):
 
 def retrieve_runbooks(query, incident_family=None, limit=3):
     """Hybrid metadata-aware retrieval with a lexical relevance gate."""
+    limit = max(1, int(limit))
     query_terms = _query_terms(query)
     if not query_terms:
         return {
