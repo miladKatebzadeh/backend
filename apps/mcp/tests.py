@@ -118,29 +118,13 @@ class MCPToolApiTests(APITestCase):
         audit = AuditEvent.objects.filter(resource_type='system_setting').first()
         self.assertNotIn('sk-lf-test-secret', json.dumps(audit.payload))
 
-        captured = {}
-        previous = sys.modules.get('langfuse')
-
-        class Client:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        sys.modules['langfuse'] = types.SimpleNamespace(Langfuse=Client)
         from apps.mcp.diagnostics import reset_langfuse
-
-        def restore_langfuse():
-            reset_langfuse()
-            if previous is None:
-                sys.modules.pop('langfuse', None)
-            else:
-                sys.modules['langfuse'] = previous
-
-        self.addCleanup(restore_langfuse)
         reset_langfuse()
-        self.assertIsNotNone(self.langfuse.temp_original())
-        self.assertEqual(captured['base_url'], 'http://10.0.0.8:3030')
-        self.assertEqual(captured['public_key'], 'pk-lf-test-public')
-        self.assertEqual(captured['secret_key'], 'sk-lf-test-secret')
+        self.addCleanup(reset_langfuse)
+        client = self.langfuse.temp_original()
+        self.assertEqual(client.base_url, 'http://10.0.0.8:3030')
+        self.assertEqual(client.public_key, 'pk-lf-test-public')
+        self.assertEqual(client.secret_key, 'sk-lf-test-secret')
 
     def test_langfuse_probe_checks_access_and_can_send_a_trace(self):
         class Response:
@@ -262,41 +246,52 @@ class MCPToolApiTests(APITestCase):
         self.assertFalse(payload['incident_detected'])
 
     def test_chat_writes_a_langfuse_span(self):
-        span = patch('apps.mcp.diagnostics._chat').start()
-        self.addCleanup(span.stop)
-        span.return_value = '{"incident_detected": false, "engine_status": "ok", "diagnostic_report": "ok", "error_scope": "none"}'
-        manager = type('Manager', (), {})()
-        opened = {}
+        from apps.mcp.diagnostics import _LangfuseTarget
 
-        def enter(self):
-            opened['span'] = self
-            return self
+        chat = patch('apps.mcp.diagnostics._chat').start()
+        self.addCleanup(chat.stop)
+        chat.return_value = '{"incident_detected": false, "engine_status": "ok", "diagnostic_report": "ok", "error_scope": "none"}'
+        posted = {}
 
-        def exit_(self, exc_type, exc, tb):
-            opened['closed'] = True
-            return False
+        class Response:
+            status_code = 207
+            content = b'{}'
+            text = ''
 
-        manager.__enter__ = enter.__get__(manager)
-        manager.__exit__ = exit_.__get__(manager)
-        def start(self, **kwargs):
-            opened.setdefault('names', []).append(kwargs.get('name'))
-            return manager
+            def json(self):
+                return {'successes': [{'id': '1'}], 'errors': []}
 
-        client = type('Client', (), {
-            'start_as_current_observation': start,
-            'flush': lambda self: opened.setdefault('flushed', True),
-        })()
-        manager.update = lambda **kwargs: opened.__setitem__('output', kwargs)
-        with patch('apps.mcp.diagnostics.get_langfuse', return_value=client):
+        def capture(url, json=None, auth=None, timeout=None, allow_redirects=None):
+            posted['url'] = url
+            posted['json'] = json
+            posted['auth'] = auth
+            return Response()
+
+        client = _LangfuseTarget('pk-lf-test-public', 'sk-lf-test-secret', 'http://10.0.0.8:3030')
+        with patch('apps.mcp.diagnostics.get_langfuse', return_value=client), patch('apps.mcp.diagnostics.requests.post', side_effect=capture):
             result = self.client.post('/api/mcp/chat/', {'message': 'container web exited'}, format='json')
         self.assertEqual(result.status_code, 200)
-        self.assertTrue(opened.get('closed'))
-        self.assertTrue(opened.get('flushed'))
-        self.assertEqual(opened['output']['output']['engine_status'], 'ok')
-        self.assertEqual(opened['output']['output']['laya']['incident_family'], 'container_runtime')
-        self.assertIn('runbooks', opened['output']['output']['chromadb'])
-        self.assertEqual(opened['names'][0], 'hierarchical_diagnostic_routing')
-        self.assertEqual(opened['names'][1:], ['laya', 'chromadb', 'telemetry', 'llm'])
+        self.assertEqual(posted['url'], 'http://10.0.0.8:3030/api/public/ingestion')
+        self.assertEqual(posted['auth'], ('pk-lf-test-public', 'sk-lf-test-secret'))
+        batch = posted['json']['batch']
+        names = [event['body']['name'] for event in batch]
+        self.assertEqual(names[0], 'hierarchical_diagnostic_routing')
+        self.assertEqual(names[1:], ['laya', 'chromadb', 'telemetry', 'llm'])
+        self.assertEqual(batch[0]['type'], 'trace-create')
+        self.assertEqual(batch[0]['body']['output']['engine_status'], 'ok')
+        self.assertEqual(batch[0]['body']['output']['laya']['incident_family'], 'container_runtime')
+        self.assertIn('runbooks', batch[0]['body']['output']['chromadb'])
+        self.assertTrue(all(event['body']['traceId'] == batch[0]['body']['id'] for event in batch[1:]))
+        self.assertEqual(batch[-1]['type'], 'generation-create')
+        self.assertNotIn('/api/public/otel', posted['url'])
+
+    def test_langfuse_base_url_drops_the_otel_suffix(self):
+        saved = self.client.post('/api/mcp/settings/', {
+            'langfuse_base_url': 'http://10.0.0.8:3030/api/public/otel/v1/traces',
+            'langfuse_public_key': 'pk-lf-test-public',
+        }, format='json')
+        self.assertEqual(saved.status_code, 200, saved.data)
+        self.assertEqual(self.client.get('/api/mcp/settings/').data['langfuse_base_url'], 'http://10.0.0.8:3030')
 
     def test_slow_laya_does_not_block_ollama(self):
         import time
@@ -315,61 +310,15 @@ class MCPToolApiTests(APITestCase):
         self.assertEqual(chat.call_count, 1)
         self.assertEqual(result.data['router'], 'keywords')
 
-    def test_child_span_is_not_started_as_a_new_trace(self):
-        from apps.mcp.diagnostics import _child_span
-        called = {}
-
-        class Manager:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                called['exited'] = True
-                return False
-
-        def start_current(self, **kwargs):
-            called['current'] = kwargs
-            return Manager()
-
-        def start_detached(self, **kwargs):
-            called['detached'] = kwargs
-
-        client = type('Client', (), {
-            'start_as_current_observation': start_current,
-            'start_observation': start_detached,
-        })()
-        with _child_span(client, 'laya', {'message': 'disk full'}, parent=object()):
-            pass
-        self.assertEqual(called['current']['name'], 'laya')
-        self.assertNotIn('trace_context', called['current'])
-        self.assertNotIn('detached', called)
-        self.assertTrue(called['exited'])
-
-    def test_v2_children_hang_from_the_parent_trace(self):
-        from apps.mcp.diagnostics import _child_span
-        created = {}
-
-        class Observation:
-            def update(self, **kwargs):
-                created['output'] = kwargs
-
-            def end(self):
-                created['ended'] = True
-
-        class Trace:
-            def span(self, **kwargs):
-                created['span'] = kwargs
-                return Observation()
-
-            def generation(self, **kwargs):
-                created['generation'] = kwargs
-                return Observation()
-
-        with _child_span(None, 'chromadb', {'query': 'disk'}, parent=Trace()) as span:
+    def test_child_spans_share_the_parent_trace(self):
+        from apps.mcp.diagnostics import _LangfuseTarget, _Trace, _child_span
+        trace = _Trace('hierarchical_diagnostic_routing', {'incident_raw': 'disk'})
+        client = _LangfuseTarget('pk-lf-test-public', 'sk-lf-test-secret', 'http://10.0.0.8:3030')
+        with _child_span(client, 'chromadb', {'query': 'disk'}, parent=trace) as span:
             span.update(output={'runbooks': ['restart']})
-        self.assertEqual(created['span']['name'], 'chromadb')
-        self.assertEqual(created['output']['output']['runbooks'], ['restart'])
-        self.assertTrue(created['ended'])
+        self.assertEqual(trace.children[0].name, 'chromadb')
+        self.assertEqual(trace.children[0].output['runbooks'], ['restart'])
+        self.assertIsNotNone(trace.children[0].ended_at)
 
     def test_laya_answers_drive_the_route(self):
         from apps.mcp.diagnostics import route

@@ -102,7 +102,13 @@ def _normalize_http_url(key, value):
 
 def _clean_setting(key, value):
     if key in URL_SETTINGS:
-        return _normalize_http_url(key, value)
+        normalized = _normalize_http_url(key, value)
+        if key == 'langfuse_base_url':
+            for suffix in ('/api/public/otel/v1/traces', '/api/public/otel', '/api/public/ingestion', '/api/public'):
+                if normalized.endswith(suffix):
+                    normalized = normalized[:-len(suffix)]
+                    break
+        return normalized
     if key == 'chroma_port':
         port = int(value)
         if not 1 <= port <= 65535:

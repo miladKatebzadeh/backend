@@ -2,7 +2,10 @@ import json
 import logging
 import os
 import threading
+import uuid
 from contextlib import contextmanager
+
+import requests
 
 from django.db.models import Q
 from django.utils import timezone
@@ -150,63 +153,139 @@ def get_langfuse():
         if _langfuse_checked and _langfuse_signature == signature:
             return _langfuse
         _langfuse_signature = signature
-        _langfuse = None
         public, secret, host = signature
         if not secret or not public:
             logger.warning('Langfuse credentials missing')
-            _langfuse_checked = True
-            return None
-        try:
-            from langfuse import Langfuse
-            try:
-                _langfuse = Langfuse(secret_key=secret, public_key=public, base_url=host)
-            except TypeError:
-                _langfuse = Langfuse(secret_key=secret, public_key=public, host=host)
-            logger.info('Langfuse initialized: %s', host)
-        except Exception:
-            logger.exception('Langfuse initialization failed')
             _langfuse = None
-        finally:
-            _langfuse_checked = True
+        else:
+            _langfuse = _LangfuseTarget(public, secret, host)
+            logger.info('Langfuse ingestion target: %s', host)
+        _langfuse_checked = True
 
     return _langfuse
+
+
+class _LangfuseTarget:
+    def __init__(self, public_key, secret_key, base_url):
+        self.public_key = public_key
+        self.secret_key = secret_key
+        self.base_url = base_url.rstrip('/')
+
+
+class _Observation:
+    def __init__(self, name, payload, kind='span', model=None):
+        self.id = str(uuid.uuid4())
+        self.name = name
+        self.input = payload
+        self.output = None
+        self.kind = kind
+        self.model = model
+        self.start = timezone.now()
+        self.ended_at = None
+
+    def update(self, **kwargs):
+        if 'output' in kwargs:
+            self.output = kwargs['output']
+        if 'input' in kwargs:
+            self.input = kwargs['input']
+
+    def update_trace(self, **kwargs):
+        self.update(**kwargs)
+
+    def end(self):
+        if self.ended_at is None:
+            self.ended_at = timezone.now()
+
+
+class _Trace(_Observation):
+    def __init__(self, name, payload):
+        super().__init__(name, payload, kind='trace')
+        self.children = []
 
 
 def _open_trace(langfuse, name, payload):
     if langfuse is None:
         return None
+    trace = _Trace(name, payload)
+    return {'span': trace, 'client': langfuse}
+
+
+def _iso(value):
+    return value.isoformat()
+
+
+def _ingestion_event(kind, body):
+    return {
+        'id': str(uuid.uuid4()),
+        'type': kind,
+        'timestamp': _iso(timezone.now()),
+        'body': body,
+    }
+
+
+def _flush_ingestion(client, trace):
+    if client is None or trace is None:
+        return
+    batch = [_ingestion_event('trace-create', {
+        'id': trace.id,
+        'timestamp': _iso(trace.start),
+        'name': trace.name,
+        'input': trace.input,
+        'output': trace.output,
+    })]
+    for child in trace.children:
+        child.end()
+        body = {
+            'id': child.id,
+            'traceId': trace.id,
+            'name': child.name,
+            'startTime': _iso(child.start),
+            'endTime': _iso(child.ended_at or child.start),
+            'input': child.input,
+            'output': child.output,
+        }
+        event_type = 'span-create'
+        if child.kind == 'generation':
+            event_type = 'generation-create'
+            if child.model:
+                body['model'] = child.model
+        batch.append(_ingestion_event(event_type, body))
     try:
-        if hasattr(langfuse, 'start_as_current_observation'):
-            manager = langfuse.start_as_current_observation(as_type='span', name=name, input=payload)
-            return {'span': manager.__enter__(), 'manager': manager, 'manual': False}
-        if hasattr(langfuse, 'start_span'):
-            return {'span': langfuse.start_span(name=name, input=payload), 'manager': None, 'manual': True}
-        if hasattr(langfuse, 'trace'):
-            return {'span': langfuse.trace(name=name, input=payload), 'manager': None, 'manual': False}
-        logger.warning('Installed Langfuse client has no span API.')
+        response = requests.post(
+            f'{client.base_url}/api/public/ingestion',
+            json={'batch': batch},
+            auth=(client.public_key, client.secret_key),
+            timeout=4,
+            allow_redirects=False,
+        )
     except Exception:
-        logger.exception('Langfuse trace was not started')
-    return None
+        logger.exception('Langfuse ingestion failed')
+        return
+    if response.status_code in (401, 403):
+        logger.warning('Langfuse rejected the trace keys.')
+        return
+    if response.status_code >= 400:
+        logger.warning('Langfuse ingestion failed: %s %s', response.status_code, (response.text or '')[:200])
+        return
+    try:
+        payload = response.json() if response.content else {}
+    except ValueError:
+        return
+    errors = payload.get('errors') if isinstance(payload, dict) else None
+    if errors:
+        logger.warning('Langfuse ingestion rejected part of the trace: %s', str(errors)[:300])
 
 
 def _close_trace(handle, output):
     if not handle:
         return
-    span = handle['span']
+    trace = handle['span']
     try:
-        if hasattr(span, 'update_trace'):
-            span.update_trace(output=output)
-        if hasattr(span, 'update'):
-            span.update(output=output)
+        trace.update_trace(output=output)
+        trace.end()
     except Exception:
         logger.exception('Langfuse trace update failed')
-    try:
-        if handle['manager'] is not None:
-            handle['manager'].__exit__(None, None, None)
-        elif handle['manual'] and hasattr(span, 'end'):
-            span.end()
-    except Exception:
-        logger.exception('Langfuse trace close failed')
+    _flush_ingestion(handle.get('client'), trace)
 
 
 def _compact(value, limit=1500):
@@ -221,57 +300,24 @@ def _compact(value, limit=1500):
     return text[:limit]
 
 
-def _v2_parent(parent):
-    return parent is not None and callable(getattr(parent, 'span', None)) and callable(getattr(parent, 'generation', None))
-
-
 @contextmanager
 def _child_span(langfuse, name, payload, as_type='span', model=None, parent=None):
-    observation = None
-    manager = None
-    started = True
-    try:
-        if _v2_parent(parent):
-            kwargs = {'name': name, 'input': payload}
-            if as_type == 'generation' and model:
-                kwargs['model'] = model
-            if as_type == 'generation':
-                observation = parent.generation(**kwargs)
-            else:
-                observation = parent.span(**kwargs)
-        elif langfuse is not None and hasattr(langfuse, 'start_as_current_observation'):
-            kwargs = {'as_type': as_type, 'name': name, 'input': _compact(payload)}
-            if model:
-                kwargs['model'] = model
-            try:
-                manager = langfuse.start_as_current_observation(**kwargs)
-            except TypeError:
-                manager = langfuse.start_as_current_observation(name=name, input=_compact(payload))
-            observation = manager.__enter__()
-        elif langfuse is not None and hasattr(langfuse, 'start_observation'):
-            kwargs = {'name': name, 'as_type': as_type, 'input': _compact(payload)}
-            if model:
-                kwargs['model'] = model
-            try:
-                observation = langfuse.start_observation(**kwargs)
-            except TypeError:
-                observation = langfuse.start_observation(name=name, input=_compact(payload))
-        else:
-            started = False
-    except Exception:
-        logger.exception('Langfuse child span was not started: %s', name)
-        started = False
-    if not started:
+    trace = parent if isinstance(parent, _Trace) else None
+    if trace is None or langfuse is None:
         yield None
         return
+    observation = _Observation(
+        name,
+        _compact(payload),
+        kind='generation' if as_type == 'generation' else 'span',
+        model=model,
+    )
+    trace.children.append(observation)
     try:
         yield observation
     finally:
         try:
-            if manager is not None:
-                manager.__exit__(None, None, None)
-            elif observation is not None and hasattr(observation, 'end'):
-                observation.end()
+            observation.end()
         except Exception:
             logger.exception('Langfuse child span close failed: %s', name)
 
@@ -785,11 +831,6 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
             },
             'reply': _compact(reply_text, 4000),
         })
-        if langfuse is not None:
-            try:
-                langfuse.flush()
-            except Exception:
-                logger.exception('Langfuse flush failed')
     return {'reply': reply_text, 'engine_status': engine_status, 'agent_automation': agent, 'decisions': decisions}
 
 
