@@ -57,8 +57,39 @@ def get_laya():
     return None
 
 
+def _laya_timeout():
+    try:
+        return float(os.getenv('OPSHUB_LAYA_TIMEOUT', '12') or 12)
+    except ValueError:
+        return 12
+
+
+def _retire_laya(reason):
+    """Drop Laya for the rest of this process. Later messages must not wait on it again."""
+    global _laya_model, _laya_checked, _laya_loading
+    with _laya_lock:
+        _laya_model = None
+        _laya_checked = True
+        _laya_loading = False
+    logger.warning('%s Keyword routing will be used.', reason)
+
+
+def _probe_laya(model):
+    predict = getattr(model, 'predict', None)
+    if not callable(predict):
+        return model
+    try:
+        result = _within(lambda: predict({'message': 'ping', 'snapshot': ''}, LAYA_QUESTIONS), _laya_timeout())
+    except Exception:
+        logger.exception('Laya probe failed')
+        return None
+    if result is _TimedOut or not isinstance(result, dict):
+        return None
+    return model
+
+
 def warmup_laya():
-    """Load Laya once, when the process starts."""
+    """Load Laya once, when the process starts, and prove it can answer before any user waits."""
     global _laya_model, _laya_checked, _laya_loading
     if os.getenv('OPSHUB_DISABLE_LAYA', '').strip().lower() in ('1', 'true', 'yes', 'on'):
         logger.info('Laya disabled by OPSHUB_DISABLE_LAYA.')
@@ -75,9 +106,14 @@ def warmup_laya():
         from laya import Router
         preload = os.getenv('LAYA_PRELOAD', '').strip().lower() in ('1', 'true', 'yes', 'on')
         model = Router(preload=preload)
-        logger.info('Laya warmup finished.')
+        model = _probe_laya(model)
+        if model is None:
+            logger.warning('Laya did not answer during startup; keyword routing will be used.')
+        else:
+            logger.info('Laya warmup finished.')
     except Exception:
         logger.exception('Laya router is unavailable; keyword routing will be used.')
+        model = None
     with _laya_lock:
         _laya_model = model
         _laya_checked = True
@@ -306,14 +342,12 @@ def route(user_message: str, context: dict) -> dict:
         return decisions
     state = {'message': user_message, 'snapshot': context.get('fleet_anomaly_snapshot', '')}
     try:
-        timeout = float(os.getenv('OPSHUB_LAYA_TIMEOUT', '12') or 12)
-        result = _within(lambda: model.predict(state, LAYA_QUESTIONS), timeout)
+        result = _within(lambda: model.predict(state, LAYA_QUESTIONS), _laya_timeout())
     except Exception:
         logger.exception('Laya routing failed')
         result = None
     if result is _TimedOut or not isinstance(result, dict):
-        if result is _TimedOut:
-            logger.warning('Laya predict timed out; keyword routing will be used.')
+        _retire_laya('Laya predict timed out.' if result is _TimedOut else 'Laya routing failed.')
         decisions = keyword_decisions(user_message)
         decisions['router'] = 'keywords'
         return decisions

@@ -444,6 +444,62 @@ class MCPToolApiTests(APITestCase):
             diagnostics._laya_loading = False
             self.laya.start()
 
+    def test_startup_probe_retires_laya_when_it_does_not_answer(self):
+        import time
+        import apps.mcp.diagnostics as diagnostics
+        self.laya.stop()
+        diagnostics._laya_checked = False
+        diagnostics._laya_model = None
+        diagnostics._laya_loading = False
+
+        class SlowRouter:
+            def predict(self, state, questions):
+                time.sleep(1)
+
+        class LayaModule:
+            @staticmethod
+            def Router(preload=False):
+                return SlowRouter()
+
+        try:
+            with patch.dict(os.environ, {'OPSHUB_LAYA_TIMEOUT': '0.05'}), patch.dict(sys.modules, {'laya': LayaModule}):
+                diagnostics.warmup_laya()
+            self.assertTrue(diagnostics._laya_checked)
+            self.assertIsNone(diagnostics.get_laya())
+        finally:
+            diagnostics._laya_checked = False
+            diagnostics._laya_model = None
+            diagnostics._laya_loading = False
+            self.laya.start()
+
+    def test_one_laya_timeout_does_not_delay_the_next_message(self):
+        import time
+        import apps.mcp.diagnostics as diagnostics
+        self.laya.stop()
+        calls = {'n': 0}
+
+        class SlowRouter:
+            def predict(self, state, questions):
+                calls['n'] += 1
+                time.sleep(1)
+
+        diagnostics._laya_checked = True
+        diagnostics._laya_model = SlowRouter()
+        diagnostics._laya_loading = False
+        try:
+            with patch.dict(os.environ, {'OPSHUB_LAYA_TIMEOUT': '0.05'}):
+                first = diagnostics.route('disk is full on the host', {})
+                second = diagnostics.route('disk is full on the host', {})
+            self.assertEqual(first['router'], 'keywords')
+            self.assertEqual(second['router'], 'keywords')
+            self.assertEqual(calls['n'], 1)
+            self.assertIsNone(diagnostics.get_laya())
+        finally:
+            diagnostics._laya_checked = False
+            diagnostics._laya_model = None
+            diagnostics._laya_loading = False
+            self.laya.start()
+
     def test_chat_sends_laya_section_and_runbook_to_the_model(self):
         chat = patch('apps.mcp.diagnostics._chat').start()
         self.addCleanup(chat.stop)
