@@ -645,6 +645,14 @@ def _parse_diagnosis(reply_text):
         return None
     refs = payload.get('evidence_refs')
     payload['evidence_refs'] = [str(item) for item in refs if str(item).strip()] if isinstance(refs, list) else []
+    if 'tool_name' in payload and not isinstance(payload.get('tool_name'), str):
+        return None
+    if 'tool_target' in payload and not isinstance(payload.get('tool_target'), str):
+        return None
+    if isinstance(payload.get('tool_name'), str):
+        payload['tool_name'] = payload['tool_name'].strip()
+    if isinstance(payload.get('tool_target'), str):
+        payload['tool_target'] = payload['tool_target'].strip()
     payload['engine_status'] = 'ok'
     return payload
 
@@ -659,8 +667,35 @@ def _invalid_diagnosis():
     })
 
 
+def active_tool_catalog():
+    catalog = []
+    try:
+        rows = (
+            MCPTool.objects.filter(status='active', archived_at__isnull=True)
+            .exclude(code='')
+            .order_by('name')[:40]
+        )
+    except Exception:
+        logger.exception('tool catalog failed')
+        return []
+    for tool in rows:
+        catalog.append({'name': tool.name, 'description': (tool.description or '').strip()[:400]})
+    return catalog
+
+
+def _active_tools():
+    return MCPTool.objects.filter(status='active', archived_at__isnull=True).exclude(code='')
+
+
 def maybe_execute(reply_text: str, decisions: dict) -> dict:
-    meta = {'agent_triggered': False, 'sandbox_output': None, 'target': '', 'resolved': False, 'checked': None}
+    meta = {
+        'agent_triggered': False,
+        'sandbox_output': None,
+        'target': '',
+        'resolved': False,
+        'checked': None,
+        'proof': 'not rechecked',
+    }
     try:
         parsed = json.loads(reply_text)
     except (TypeError, json.JSONDecodeError):
@@ -669,37 +704,59 @@ def maybe_execute(reply_text: str, decisions: dict) -> dict:
     if not isinstance(parsed, dict) or parsed.get('engine_status') == 'offline' or not parsed.get('incident_detected'):
         return meta
     scope = str(parsed.get('error_scope') or '').strip()
-    meta['target'] = scope
-    if not scope or scope.lower() in ('none', 'engine'):
-        return meta
-    needle = slugify(scope).replace('-', '_')
-    tools = MCPTool.objects.filter(status='active', archived_at__isnull=True)
-    tool = tools.filter(name__iexact=needle).first() if needle else None
-    if tool is None and len(needle) >= 3:
-        tool = tools.filter(name__icontains=needle).first()
-    if tool is None and decisions.get('incident_family') == 'container_runtime':
-        tool = tools.filter(Q(name='docker_container_restarter') | Q(name='restart_container')).first()
-    if tool is None or not tool.code:
-        meta['error'] = 'no matching active tool'
+    target = str(parsed.get('tool_target') or '').strip() or scope
+    meta['target'] = target
+    tools = _active_tools()
+    if 'tool_name' in parsed:
+        chosen = str(parsed.get('tool_name') or '').strip()
+        meta['chosen_tool'] = chosen
+        if not chosen:
+            meta['error'] = 'model chose no tool'
+            return meta
+        tool = tools.filter(name=chosen).first()
+        if tool is None:
+            meta['error'] = 'model chose a tool that is not active'
+            return meta
+    else:
+        if not scope or scope.lower() in ('none', 'engine'):
+            return meta
+        needle = slugify(scope).replace('-', '_')
+        tool = tools.filter(name__iexact=needle).first() if needle else None
+        if tool is None and len(needle) >= 3:
+            tool = tools.filter(name__icontains=needle).first()
+        if tool is None and decisions.get('incident_family') == 'container_runtime':
+            tool = tools.filter(Q(name='docker_container_restarter') | Q(name='restart_container')).first()
+        if tool is None:
+            meta['error'] = 'no matching active tool'
+            return meta
+    if not target or target.lower() in ('none', 'engine'):
+        meta['error'] = 'no target'
         return meta
     meta['agent_triggered'] = True
     meta['matched_tool'] = tool.name
-    meta['sandbox_output'] = MCPSandboxExecutor.execute_tool_safe(tool.code, {'TARGET_RESOURCE': scope})
+    meta['sandbox_output'] = MCPSandboxExecutor.execute_tool_safe(tool.code, {'TARGET_RESOURCE': target})
     return meta
 
 
 def _confirm_recovery(agent, decisions):
     agent['resolved'] = False
+    agent['proof'] = 'not rechecked'
     if not agent.get('agent_triggered'):
         return
     output = agent.get('sandbox_output') or {}
     if not output.get('success'):
+        agent['proof'] = 'tool failed'
         return
-    if decisions.get('incident_family') != 'container_runtime':
+    tool_name = str(agent.get('matched_tool') or '')
+    containerish = decisions.get('incident_family') == 'container_runtime' or any(
+        word in tool_name for word in ('container', 'docker', 'restart')
+    )
+    if not containerish:
         return
     from apps.collector.tasks import container_state
     state = container_state(agent.get('target') or '')
     agent['checked'] = state
+    agent['proof'] = 'container state'
     agent['resolved'] = state == 'running'
 
 
@@ -768,6 +825,7 @@ def diagnose(user_message: str, allow_remediation: bool = False) -> dict:
         except Exception:
             logger.exception('evidence query failed')
             evidence = {}
+        catalog = active_tool_catalog()
         packet = _compact(f"""ERROR:
 {user_message}
 
@@ -779,14 +837,19 @@ LAYA:
 
 RUNBOOK:
 {chr(10).join(documents) if documents else 'No runbook found.'}
+
+TOOLS:
+{json.dumps(catalog) if catalog else 'No active tools.'}
 """, 5000)
-        packet += "\n\nReturn only JSON with keys incident_detected, error_scope, diagnostic_report, evidence_refs, engine_status."
+        packet += "\n\nReturn only JSON with keys incident_detected, error_scope, diagnostic_report, evidence_refs, engine_status, tool_name, tool_target."
         system_prompt = """
-You are the OpsHub diagnostics engine.
-The user message has the error, the section chosen by Laya, and the runbook.
+You are the Revive diagnostics engine.
+The user message has the error, the section chosen by routing, the runbook, and the active tools.
 Use only those. If a claim is not supported by them, say you do not know.
-Do not claim an action was executed.
-Return only JSON with keys incident_detected (boolean), error_scope (string), diagnostic_report (string), evidence_refs (array of short strings copied from the error or runbook labels), engine_status (string, use "ok").
+Choose at most one tool. tool_name must be an exact name from TOOLS, or an empty string if none should run.
+tool_target is the resource that tool should act on, copied from the error, or an empty string.
+Do not invent a tool name. Do not claim a tool has already run.
+Return only JSON with keys incident_detected (boolean), error_scope (string), diagnostic_report (string), evidence_refs (array of short strings copied from the error or runbook labels), engine_status (string, use "ok"), tool_name (string), tool_target (string).
 """
         retry_prompt = system_prompt + '\nThe previous reply was rejected. Return only the JSON object.'
         try:

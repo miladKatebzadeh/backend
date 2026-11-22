@@ -266,6 +266,10 @@ def _action_payload(result):
         parts.append(f"Container is {agent.get('checked')}, so this is not marked resolved.")
     elif agent.get('resolved'):
         parts.append('Container is running.')
+    elif agent.get('proof') == 'container state' and agent.get('checked') is None:
+        parts.append('Docker could not be rechecked, so this is not marked resolved.')
+    elif agent.get('proof') == 'not rechecked':
+        parts.append('The tool finished. No external state was rechecked.')
     return {
         'triggered': True,
         'tool': agent.get('matched_tool') or '',

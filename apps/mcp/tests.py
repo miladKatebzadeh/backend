@@ -559,6 +559,78 @@ class MCPToolApiTests(APITestCase):
         self.assertEqual(meta['matched_tool'], 'web_nginx')
         self.assertIn('fixed web_nginx', meta['sandbox_output']['stdout'])
 
+    def test_model_choice_selects_the_tool_and_ignores_a_name_guess(self):
+        from apps.mcp.diagnostics import maybe_execute
+        MCPTool.objects.create(name='restart_container', description='Restart a container', code='def main(name):\n    return "restarted " + name\n', status='active')
+        MCPTool.objects.create(name='web', description='decoy', code='def main(name):\n    return "wrong"\n', status='active')
+        reply = json.dumps({
+            'incident_detected': True,
+            'error_scope': 'web',
+            'tool_name': 'restart_container',
+            'tool_target': 'web',
+            'diagnostic_report': 'down',
+            'engine_status': 'ok',
+        })
+        meta = maybe_execute(reply, {'incident_family': 'container_runtime'})
+        self.assertEqual(meta['matched_tool'], 'restart_container')
+        self.assertIn('restarted web', meta['sandbox_output']['stdout'])
+
+        unknown = json.dumps({
+            'incident_detected': True,
+            'error_scope': 'web',
+            'tool_name': 'not_a_tool',
+            'tool_target': 'web',
+            'diagnostic_report': 'down',
+            'engine_status': 'ok',
+        })
+        rejected = maybe_execute(unknown, {'incident_family': 'container_runtime'})
+        self.assertFalse(rejected['agent_triggered'])
+        self.assertEqual(rejected['error'], 'model chose a tool that is not active')
+
+        declined = json.dumps({
+            'incident_detected': True,
+            'error_scope': 'web',
+            'tool_name': '',
+            'diagnostic_report': 'down',
+            'engine_status': 'ok',
+        })
+        skipped = maybe_execute(declined, {'incident_family': 'container_runtime'})
+        self.assertFalse(skipped['agent_triggered'])
+        self.assertEqual(skipped['error'], 'model chose no tool')
+
+    def test_diagnosis_shows_tools_and_does_not_mark_a_dead_container_resolved(self):
+        from apps.mcp.diagnostics import diagnose
+        MCPTool.objects.create(
+            name='restart_container',
+            description='Restart one stopped container',
+            code='def main(name):\n    return "restarted " + name\n',
+            status='active',
+        )
+        seen = {}
+
+        def fake_chat(host, model, system, packet):
+            seen['system'] = system
+            seen['packet'] = packet
+            return json.dumps({
+                'incident_detected': True,
+                'error_scope': 'web',
+                'diagnostic_report': 'web is stopped',
+                'evidence_refs': ['web'],
+                'engine_status': 'ok',
+                'tool_name': 'restart_container',
+                'tool_target': 'web',
+            })
+
+        with patch('apps.mcp.diagnostics._chat', side_effect=fake_chat), patch('apps.collector.tasks.container_state', return_value='exited'):
+            result = diagnose('container web exited', allow_remediation=True)
+        self.assertIn('restart_container', seen['packet'])
+        self.assertIn('Restart one stopped container', seen['packet'])
+        self.assertIn('exact name', seen['system'])
+        self.assertEqual(result['agent_automation']['matched_tool'], 'restart_container')
+        self.assertEqual(result['agent_automation']['checked'], 'exited')
+        self.assertFalse(result['agent_automation']['resolved'])
+        self.assertEqual(result['agent_automation']['proof'], 'container state')
+
     def test_telemetry_is_empty_instead_of_crashing(self):
         result = self.client.get('/api/infrastructure/telemetry/')
         self.assertEqual(result.status_code, 200)
