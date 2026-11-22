@@ -1,15 +1,12 @@
-# Small runtime set. A fresh image should resolve in seconds, not hours.
-# Left out on purpose (each already falls back if missing):
-#   laya        -> torch + transformers, several GB; keyword routing remains
-#   chromadb    -> ONNX embedding stack; runbook search stays on Postgres
-#   langfuse    -> tracing only, and it fights chromadb in the resolver
-#   docker      -> collector and sandbox talk to the daemon over HTTP
 Django>=5.1,<6.0
-djangorestframework>=3.15,<4
-django-cors-headers>=4.4,<5
-psycopg2-binary>=2.9,<3
-python-dotenv>=1.0,<2
-requests>=2.32,<3
-ollama>=0.4,<1
-pypdf>=5.0,<6
-gunicorn>=22,<26
+djangorestframework>=3.15
+django-cors-headers>=4.4
+psycopg2-binary
+python-dotenv>=1.0
+requests>=2.32
+docker>=7.0
+ollama>=0.4
+chromadb>=0.5
+pypdf>=5.0
+langfuse>=3
+laya>=0.4
