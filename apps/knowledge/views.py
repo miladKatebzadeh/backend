@@ -79,8 +79,13 @@ class DocumentViewSet(viewsets.ModelViewSet):
         document = serializer.save()
         metadata = document.metadata if isinstance(document.metadata, dict) else {}
         source = metadata.get("source") or "Manual Ingestion"
+        runbook_fields = {"id", "section", "component", "title", "keywords"}
+        preserved_metadata = {
+            key: value for key, value in metadata.items()
+            if key not in runbook_fields
+        }
         document.metadata = {
-            **metadata,
+            **preserved_metadata,
             **front_matter,
             "source": source,
             "content_hash": content_fingerprint(document.content),
@@ -138,6 +143,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         runbook_id = str(front_matter.get('id') or '').strip()
         runbook_slug = slugify(runbook_id) if runbook_id else ''
+        if runbook_id and not runbook_slug:
+            runbook_slug = content_fingerprint(runbook_id)[:32]
         external_id = (
             f"runbook_{runbook_slug[:160]}"
             if runbook_slug
