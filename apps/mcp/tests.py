@@ -345,6 +345,100 @@ class MCPToolApiTests(APITestCase):
         self.assertTrue(decisions['need_ci_logs'])
         self.assertFalse(decisions['need_container_events'])
 
+    def test_laya_deployment_family_selects_deployment_evidence(self):
+        from apps.mcp.diagnostics import route
+
+        class Router:
+            def predict(self, state, questions):
+                return {
+                    'answers': {
+                        'incident_family': {'choice': 'deployment_regression'},
+                        'need_ci_logs': {'noul': 0.01},
+                        'need_metric_window': {'noul': 0.01},
+                        'need_container_events': {'noul': 0.01},
+                        'need_deployment_changes': {'noul': 0.9},
+                    },
+                }
+
+        with patch('apps.mcp.diagnostics.get_laya', return_value=Router()):
+            decisions = route('Service failed after rollout', {})
+        self.assertEqual(decisions['incident_family'], 'deployment_regression')
+        self.assertTrue(decisions['need_deployment_changes'])
+        self.assertFalse(decisions['need_container_events'])
+
+    def test_laya_unknown_family_does_not_invent_container_evidence(self):
+        from apps.mcp.diagnostics import route
+
+        class Router:
+            def predict(self, state, questions):
+                return {
+                    'answers': {
+                        'incident_family': {'choice': 'not_a_supported_family'},
+                        'need_ci_logs': {'noul': 0.1},
+                        'need_metric_window': {'noul': 0.1},
+                        'need_container_events': {'noul': 0.1},
+                        'need_deployment_changes': {'noul': 0.1},
+                    },
+                }
+
+        with patch('apps.mcp.diagnostics.get_laya', return_value=Router()):
+            decisions = route('Please inspect this service', {})
+        self.assertEqual(decisions['incident_family'], 'unknown')
+        self.assertFalse(decisions['need_ci_logs'])
+        self.assertFalse(decisions['need_metric_window'])
+        self.assertFalse(decisions['need_container_events'])
+        self.assertFalse(decisions['need_deployment_changes'])
+
+    def test_laya_confidence_threshold_is_configurable(self):
+        from apps.mcp.diagnostics import route
+
+        class Router:
+            def predict(self, state, questions):
+                return {
+                    'answers': {
+                        'incident_family': {'choice': 'unknown'},
+                        'need_ci_logs': {'noul': 0.49},
+                        'need_metric_window': {'noul': 0.5},
+                        'need_container_events': {'noul': 0.2},
+                        'need_deployment_changes': {'noul': 0.0},
+                    },
+                }
+
+        with patch('apps.mcp.diagnostics.get_laya', return_value=Router()), patch.dict(
+            os.environ, {'OPSHUB_LAYA_CONFIDENCE_THRESHOLD': '0.5'}
+        ):
+            decisions = route('An unclear infrastructure issue', {})
+        self.assertFalse(decisions['need_ci_logs'])
+        self.assertTrue(decisions['need_metric_window'])
+        self.assertFalse(decisions['need_container_events'])
+        self.assertFalse(decisions['need_deployment_changes'])
+        self.assertEqual(decisions['incident_family'], 'unknown')
+
+    def test_keyword_fallback_handles_persian_deployment_and_unknown(self):
+        from apps.mcp.diagnostics import route
+
+        deployment = route('بعد از استقرار نسخه جدید سرویس خراب شد', {})
+        self.assertEqual(deployment['router'], 'keywords')
+        self.assertEqual(deployment['incident_family'], 'deployment_regression')
+        self.assertTrue(deployment['need_deployment_changes'])
+        self.assertFalse(deployment['need_container_events'])
+
+        unknown = route('سلام، لطفاً این وضعیت را بررسی کن', {})
+        self.assertEqual(unknown['incident_family'], 'unknown')
+        self.assertFalse(unknown['need_ci_logs'])
+        self.assertFalse(unknown['need_metric_window'])
+        self.assertFalse(unknown['need_container_events'])
+        self.assertFalse(unknown['need_deployment_changes'])
+
+    def test_keyword_fallback_can_gather_multiple_evidence_families(self):
+        from apps.mcp.diagnostics import route
+
+        decisions = route('Jenkins build failed after deployment', {})
+        self.assertEqual(decisions['router'], 'keywords')
+        self.assertEqual(decisions['incident_family'], 'ci_failure')
+        self.assertTrue(decisions['need_ci_logs'])
+        self.assertTrue(decisions['need_deployment_changes'])
+
     def test_missing_laya_uses_keywords(self):
         from apps.mcp.diagnostics import route
         decisions = route('disk is full on the host', {})
@@ -373,7 +467,15 @@ class MCPToolApiTests(APITestCase):
         diagnostics._laya_checked = False
         diagnostics._laya_model = None
         diagnostics._laya_loading = False
-        router = object()
+        class Router:
+            def __init__(self):
+                self.messages = []
+
+            def predict(self, state, questions):
+                self.messages.append(state['message'])
+                return {'answers': {}}
+
+        router = Router()
 
         class LayaModule:
             @staticmethod
@@ -384,9 +486,12 @@ class MCPToolApiTests(APITestCase):
             with patch.dict(sys.modules, {'laya': LayaModule}):
                 diagnostics.warmup_laya()
             self.assertIs(diagnostics.get_laya(), router)
+            self.assertEqual(router.messages[0], 'ping')
+            self.assertIn('زیرساختی', router.messages[1])
             with patch.dict(sys.modules, {'laya': LayaModule}):
                 diagnostics.warmup_laya()
             self.assertIs(diagnostics.get_laya(), router)
+            self.assertEqual(len(router.messages), 2)
         finally:
             diagnostics._laya_checked = False
             diagnostics._laya_model = None
