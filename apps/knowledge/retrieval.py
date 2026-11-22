@@ -4,7 +4,7 @@ import re
 from django.db.models import Q
 
 from apps.knowledge.chroma import get_chroma_collection
-from apps.knowledge.ingestion import chunk_markdown
+from apps.knowledge.ingestion import chunk_markdown, parse_front_matter
 from apps.knowledge.models import KnowledgeDocument
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,9 @@ def _candidate_from_chroma(results):
                 document_id = int(document_id)
             except (TypeError, ValueError):
                 document_id = None
+            chunk_index = metadata.get("chunk")
+            if chunk_index is None and ":" in raw_id:
+                chunk_index = raw_id.rsplit(":", 1)[1]
             distance = distance_group[item_index] if item_index < len(distance_group) else None
             try:
                 distance = float(distance) if distance is not None else None
@@ -131,7 +134,7 @@ def _candidate_from_chroma(results):
                 "text": document.strip(),
                 "title": str(metadata.get("title") or "Runbook"),
                 "document_id": document_id,
-                "chunk": metadata.get("chunk"),
+                "chunk": chunk_index,
                 "section": str(metadata.get("section") or ""),
                 "component": str(metadata.get("component") or ""),
                 "keywords": str(metadata.get("keywords") or ""),
@@ -188,7 +191,13 @@ def _postgres_candidates(query, limit=80):
     candidates = []
     for row in rows:
         metadata = row.metadata if isinstance(row.metadata, dict) else {}
-        chunks = chunk_markdown(row.content)
+        try:
+            front_matter, body = parse_front_matter(row.content)
+        except ValueError:
+            logger.warning("Skipping front matter parsing for legacy document %s", row.pk, exc_info=True)
+            front_matter, body = {}, row.content
+        metadata = {**front_matter, **metadata}
+        chunks = chunk_markdown(body)
         for index, chunk in enumerate(chunks):
             prefix = [
                 f"Title: {row.title}",
@@ -259,7 +268,13 @@ def retrieve_runbooks(query, incident_family=None, limit=3):
     candidates = []
     seen = set()
     for candidate in [*chroma_candidates, *postgres_candidates]:
-        key = candidate.get("_id")
+        document_id = candidate.get("document_id")
+        chunk_index = candidate.get("chunk")
+        key = (
+            f"{document_id}:{chunk_index}"
+            if document_id is not None and chunk_index is not None
+            else candidate.get("_id")
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -322,17 +337,21 @@ def retrieve_runbooks(query, incident_family=None, limit=3):
         if len(selected) >= limit:
             break
 
-    sources = {item["retrieval_source"] for item in selected}
-    if sources == {"chroma", "postgres"}:
+    candidate_sources = {item["retrieval_source"] for item in candidates}
+    if candidate_sources == {"chroma", "postgres"}:
         source = "hybrid"
-    elif sources == {"chroma"}:
+    elif candidate_sources == {"chroma"}:
         source = "chroma"
-    elif sources == {"postgres"}:
+    elif candidate_sources == {"postgres"}:
         source = "postgres_fallback"
     else:
         source = "none"
 
-    filters = sorted(_FAMILY_METADATA.get(str(incident_family or "").lower(), {}).get("section", ()))
+    family_config = _FAMILY_METADATA.get(str(incident_family or "").lower(), {})
+    filters = {
+        "section": list(family_config.get("section", ())),
+        "component": list(family_config.get("component", ())),
+    }
     return {
         "results": selected,
         "source": source,
