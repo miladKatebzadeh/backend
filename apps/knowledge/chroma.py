@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -118,8 +119,8 @@ def index_document(
     if isinstance(keywords, str):
         keywords = [item.strip() for item in keywords.replace(";", ",").split(",") if item.strip()]
     keywords_text = " ".join(str(item).strip() for item in keywords if str(item).strip())
-    section = str(document_metadata.get("section") or "").strip().lower()
-    component = str(document_metadata.get("component") or "").strip().lower()
+    section = re.sub(r"[\s-]+", "_", str(document_metadata.get("section") or "").strip().lower())
+    component = re.sub(r"[\s-]+", "_", str(document_metadata.get("component") or "").strip().lower())
     runbook_id = str(document_metadata.get("id") or document_id)
     content_hash = content_fingerprint(body)
 
