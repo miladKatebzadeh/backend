@@ -168,8 +168,11 @@ def _chroma_candidates(collection, query, incident_family, limit):
 
         # Keep unfiltered retrieval in the candidate pool for older vectors that
         # predate front matter metadata and for metadata that is incomplete.
-        results = collection.query(query_texts=[query], n_results=n_results)
-        candidates.extend(_candidate_from_chroma(results))
+        try:
+            results = collection.query(query_texts=[query], n_results=n_results)
+            candidates.extend(_candidate_from_chroma(results))
+        except Exception:
+            logger.info("Unfiltered Chroma retrieval failed; retaining filtered candidates.", exc_info=True)
         return candidates
     except Exception:
         logger.exception("Chroma retrieval failed")
