@@ -2,6 +2,7 @@ import ipaddress
 import os
 import re
 import time
+import uuid
 from urllib.parse import urlparse
 
 import requests
@@ -9,7 +10,7 @@ from django.utils import timezone
 from rest_framework import decorators, response, status, viewsets
 
 from apps.audit.models import AuditEvent
-from apps.mcp.diagnostics import diagnose
+from apps.mcp.diagnostics import diagnose, reset_langfuse
 from apps.mcp.models import MCPTool, MCPToolVersion, SystemSetting, get_setting, set_setting
 from apps.mcp.runtime import MCPSandboxExecutor
 from apps.mcp.serializers import MCPToolSerializer
@@ -32,9 +33,12 @@ PUBLIC_SETTINGS = (
     'chroma_port',
     'embedding_engine',
     'auto_remediate',
+    'langfuse_base_url',
+    'langfuse_public_key',
+    'langfuse_secret_key',
 )
-SECRET_SETTINGS = {'jenkins_token'}
-URL_SETTINGS = {'ollama_host', 'prometheus_url', 'alertmanager_url', 'jenkins_url', 'docker_host'}
+SECRET_SETTINGS = {'jenkins_token', 'langfuse_secret_key'}
+URL_SETTINGS = {'ollama_host', 'prometheus_url', 'alertmanager_url', 'jenkins_url', 'docker_host', 'langfuse_base_url'}
 CLEARABLE_SETTINGS = {'jenkins_user', 'docker_host', 'alertmanager_url'}
 INTEGER_SETTINGS = {
     'memory_min_mb': (64, 1_048_576),
@@ -65,6 +69,9 @@ def _defaults():
         'chroma_port': os.getenv('CHROMA_PORT', '8001'),
         'embedding_engine': 'all-MiniLM-L6-v2',
         'auto_remediate': '0',
+        'langfuse_base_url': os.getenv('LANGFUSE_BASE_URL') or os.getenv('LANGFUSE_HOST') or 'http://127.0.0.1:3030',
+        'langfuse_public_key': os.getenv('LANGFUSE_PUBLIC_KEY', ''),
+        'langfuse_secret_key': '',
     }
 
 
@@ -126,6 +133,10 @@ def _clean_setting(key, value):
         raise ValueError('embedding_engine contains unsupported characters')
     if key == 'jenkins_user' and any(char.isspace() for char in value):
         raise ValueError('jenkins_user cannot contain spaces')
+    if key in ('langfuse_public_key', 'langfuse_secret_key'):
+        if not 8 <= len(value) <= 300 or any(char.isspace() or ord(char) < 32 for char in value):
+            raise ValueError(f'{key} contains unsupported characters')
+        return value
     return value
 
 
@@ -140,6 +151,8 @@ def _stored_settings():
             payload[key] = default
     payload['jenkins_token'] = ''
     payload['jenkins_token_set'] = bool(stored.get('jenkins_token'))
+    payload['langfuse_secret_key'] = ''
+    payload['langfuse_secret_set'] = bool(stored.get('langfuse_secret_key') or os.getenv('LANGFUSE_SECRET_KEY', '').strip())
     return payload
 
 
@@ -292,7 +305,7 @@ def save_system_settings(request):
             continue
         value = str(raw_value).strip()
         if value == '':
-            if key == 'jenkins_token':
+            if key in ('jenkins_token', 'langfuse_secret_key'):
                 continue
             if key in CLEARABLE_SETTINGS:
                 cleaned[key] = ''
@@ -326,6 +339,8 @@ def save_system_settings(request):
     audit_payload = {key: value for key, value in cleaned.items() if key not in SECRET_SETTINGS}
     if 'jenkins_token' in cleaned:
         audit_payload['jenkins_token'] = 'updated'
+    if 'langfuse_secret_key' in cleaned:
+        audit_payload['langfuse_secret_key'] = 'updated'
     AuditEvent.objects.create(
         action='update',
         resource_type='system_setting',
@@ -335,6 +350,9 @@ def save_system_settings(request):
     notes = []
     if 'scrape_interval' in cleaned:
         notes.append('scrape_interval applies on the next collector cycle')
+    if any(key.startswith('langfuse_') for key in cleaned):
+        reset_langfuse()
+        notes.append('langfuse settings apply on the next diagnosis')
     body = {'status': 'success', 'saved': sorted(cleaned), 'notes': notes}
     if reindex:
         from apps.knowledge.chroma import rebuild_knowledge_index
@@ -347,6 +365,29 @@ def _probe_value(data, key):
         return str(data.get(key) or '').strip()
     defaults = _defaults()
     return get_setting(key, defaults.get(key, ''))
+
+
+def _langfuse_target(data):
+    url = _clean_setting('langfuse_base_url', _probe_value(data, 'langfuse_base_url'))
+    public = _probe_value(data, 'langfuse_public_key') or os.getenv('LANGFUSE_PUBLIC_KEY', '')
+    secret = str(data.get('langfuse_secret_key') or '').strip() or get_setting(
+        'langfuse_secret_key', os.getenv('LANGFUSE_SECRET_KEY', ''),
+    )
+    if not str(public).strip() or not str(secret).strip():
+        raise ValueError('Langfuse public key and secret key are required.')
+    return url, _clean_setting('langfuse_public_key', str(public).strip()), _clean_setting('langfuse_secret_key', str(secret).strip())
+
+
+def _project_names(payload):
+    rows = payload if isinstance(payload, list) else []
+    if isinstance(payload, dict):
+        rows = payload.get('data') or payload.get('projects') or []
+    names = []
+    if isinstance(rows, list):
+        for item in rows:
+            if isinstance(item, dict) and item.get('name'):
+                names.append(str(item['name']))
+    return names
 
 
 @decorators.api_view(['POST'])
@@ -407,10 +448,56 @@ def test_system_settings(request):
             probed.raise_for_status()
             message = 'heartbeat'
             extra = {}
+        elif service == 'langfuse':
+            url, public, secret = _langfuse_target(request.data)
+            probed = requests.get(f'{url}/api/public/projects', auth=(public, secret), timeout=4, allow_redirects=False)
+            if probed.status_code in (401, 403):
+                raise PermissionError('The keys were rejected.')
+            probed.raise_for_status()
+            names = _project_names(probed.json() if probed.content else [])
+            message = names[0] if names else 'keys accepted'
+            extra = {}
+        elif service == 'langfuse_trace':
+            url, public, secret = _langfuse_target(request.data)
+            trace_id = str(uuid.uuid4())
+            stamp = timezone.now().isoformat()
+            event = {
+                'id': str(uuid.uuid4()),
+                'type': 'trace-create',
+                'timestamp': stamp,
+                'body': {
+                    'id': trace_id,
+                    'timestamp': stamp,
+                    'name': 'revive-settings-test',
+                    'input': {'source': 'settings'},
+                    'output': {'ok': True},
+                },
+            }
+            probed = requests.post(
+                f'{url}/api/public/ingestion',
+                json={'batch': [event]},
+                auth=(public, secret),
+                timeout=5,
+                allow_redirects=False,
+            )
+            if probed.status_code in (401, 403):
+                raise PermissionError('The keys were rejected.')
+            probed.raise_for_status()
+            payload = probed.json() if probed.content else {}
+            errors = payload.get('errors') if isinstance(payload, dict) else None
+            if errors:
+                first = errors[0] if isinstance(errors, list) and errors else {}
+                detail = str(first.get('message') or first.get('error') or '') if isinstance(first, dict) else ''
+                raise ValueError(detail[:200] or 'Langfuse rejected the sample trace.')
+            message = f'revive-settings-test {trace_id}'
+            extra = {'trace_id': trace_id}
         else:
             return response.Response({'detail': 'Unknown service.', 'errors': {'service': 'unknown service'}}, status=400)
     except ValueError as exc:
         return response.Response({'status': 'invalid', 'latency_ms': 0, 'message': str(exc)})
+    except PermissionError as exc:
+        latency = int((time.perf_counter() - started) * 1000)
+        return response.Response({'status': 'invalid', 'latency_ms': latency, 'message': str(exc)})
     except Exception as exc:
         latency = int((time.perf_counter() - started) * 1000)
         return response.Response({'status': 'offline', 'latency_ms': latency, 'message': exc.__class__.__name__})

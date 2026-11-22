@@ -94,6 +94,109 @@ class MCPToolApiTests(APITestCase):
         audit = AuditEvent.objects.filter(resource_type='system_setting').first()
         self.assertNotIn('secret-token', json.dumps(audit.payload))
 
+    def test_langfuse_settings_are_masked_and_used_for_the_client(self):
+        import sys
+        import types
+
+        saved = self.client.post('/api/mcp/settings/', {
+            'langfuse_base_url': 'http://10.0.0.8:3030/',
+            'langfuse_public_key': 'pk-lf-test-public',
+            'langfuse_secret_key': 'sk-lf-test-secret',
+        }, format='json')
+        self.assertEqual(saved.status_code, 200, saved.data)
+        self.assertIn('next diagnosis', saved.data['notes'][0])
+        current = self.client.get('/api/mcp/settings/')
+        self.assertEqual(current.data['langfuse_base_url'], 'http://10.0.0.8:3030')
+        self.assertEqual(current.data['langfuse_public_key'], 'pk-lf-test-public')
+        self.assertEqual(current.data['langfuse_secret_key'], '')
+        self.assertTrue(current.data['langfuse_secret_set'])
+        stored = SystemSetting.objects.get(key='langfuse_secret_key').value
+        self.assertTrue(stored.startswith('enc:v1:'))
+        self.assertEqual(get_setting('langfuse_secret_key'), 'sk-lf-test-secret')
+        self.client.post('/api/mcp/settings/', {'langfuse_secret_key': ''}, format='json')
+        self.assertEqual(get_setting('langfuse_secret_key'), 'sk-lf-test-secret')
+        audit = AuditEvent.objects.filter(resource_type='system_setting').first()
+        self.assertNotIn('sk-lf-test-secret', json.dumps(audit.payload))
+
+        captured = {}
+        previous = sys.modules.get('langfuse')
+
+        class Client:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        sys.modules['langfuse'] = types.SimpleNamespace(Langfuse=Client)
+        from apps.mcp.diagnostics import reset_langfuse
+
+        def restore_langfuse():
+            reset_langfuse()
+            if previous is None:
+                sys.modules.pop('langfuse', None)
+            else:
+                sys.modules['langfuse'] = previous
+
+        self.addCleanup(restore_langfuse)
+        reset_langfuse()
+        self.assertIsNotNone(self.langfuse.temp_original())
+        self.assertEqual(captured['base_url'], 'http://10.0.0.8:3030')
+        self.assertEqual(captured['public_key'], 'pk-lf-test-public')
+        self.assertEqual(captured['secret_key'], 'sk-lf-test-secret')
+
+    def test_langfuse_probe_checks_access_and_can_send_a_trace(self):
+        class Response:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+                self.content = b'1' if payload is not None else b''
+
+            def json(self):
+                return self._payload
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError('http')
+
+        denied = Response(401, {})
+        with patch('apps.mcp.views.requests.get', return_value=denied):
+            rejected = self.client.post('/api/mcp/settings/test/', {
+                'service': 'langfuse',
+                'langfuse_base_url': 'http://10.0.0.8:3030',
+                'langfuse_public_key': 'pk-lf-test-public',
+                'langfuse_secret_key': 'sk-lf-test-secret',
+            }, format='json')
+        self.assertEqual(rejected.data['status'], 'invalid')
+        self.assertIn('rejected', rejected.data['message'])
+        self.assertFalse(SystemSetting.objects.filter(key='langfuse_base_url').exists())
+
+        accepted = Response(200, [{'id': 'p', 'name': 'revive'}])
+        with patch('apps.mcp.views.requests.get', return_value=accepted) as get:
+            ok = self.client.post('/api/mcp/settings/test/', {
+                'service': 'langfuse',
+                'langfuse_base_url': 'http://10.0.0.8:3030',
+                'langfuse_public_key': 'pk-lf-test-public',
+                'langfuse_secret_key': 'sk-lf-test-secret',
+            }, format='json')
+        self.assertEqual(ok.data['status'], 'connected')
+        self.assertEqual(ok.data['message'], 'revive')
+        self.assertEqual(get.call_args.args[0], 'http://10.0.0.8:3030/api/public/projects')
+        self.assertEqual(get.call_args.kwargs['auth'], ('pk-lf-test-public', 'sk-lf-test-secret'))
+
+        sent = Response(207, {'successes': [{'id': '1'}], 'errors': []})
+        with patch('apps.mcp.views.requests.post', return_value=sent) as post:
+            traced = self.client.post('/api/mcp/settings/test/', {
+                'service': 'langfuse_trace',
+                'langfuse_base_url': 'http://10.0.0.8:3030',
+                'langfuse_public_key': 'pk-lf-test-public',
+                'langfuse_secret_key': 'sk-lf-test-secret',
+            }, format='json')
+        self.assertEqual(traced.data['status'], 'connected', traced.data)
+        self.assertTrue(traced.data['trace_id'])
+        body = post.call_args.kwargs['json']['batch'][0]
+        self.assertEqual(body['type'], 'trace-create')
+        self.assertEqual(body['body']['name'], 'revive-settings-test')
+        self.assertEqual(body['body']['id'], traced.data['trace_id'])
+        self.assertNotIn('sk-lf-test-secret', json.dumps(body))
+
     def test_blank_jenkins_user_can_be_cleared(self):
         self.client.post('/api/mcp/settings/', {'jenkins_user': 'milad'}, format='json')
         cleared = self.client.post('/api/mcp/settings/', {'jenkins_user': ''}, format='json')

@@ -19,6 +19,7 @@ _laya_model = None
 _laya_checked = False
 _langfuse = None
 _langfuse_checked = False
+_langfuse_signature = None
 
 _langfuse_lock = threading.Lock()
 
@@ -83,30 +84,42 @@ def warmup_laya():
         _laya_loading = False
 
 
-def get_langfuse():
-    global _langfuse, _langfuse_checked
+def reset_langfuse():
+    global _langfuse, _langfuse_checked, _langfuse_signature
+    with _langfuse_lock:
+        _langfuse = None
+        _langfuse_checked = False
+        _langfuse_signature = None
 
-    if _langfuse_checked:
+
+def _langfuse_config():
+    public = get_setting('langfuse_public_key', os.getenv('LANGFUSE_PUBLIC_KEY', ''))
+    secret = get_setting('langfuse_secret_key', os.getenv('LANGFUSE_SECRET_KEY', ''))
+    host = get_setting(
+        'langfuse_base_url',
+        os.getenv('LANGFUSE_BASE_URL') or os.getenv('LANGFUSE_HOST') or 'http://127.0.0.1:3030',
+    )
+    return str(public or '').strip(), str(secret or '').strip(), str(host or '').strip().rstrip('/')
+
+
+def get_langfuse():
+    global _langfuse, _langfuse_checked, _langfuse_signature
+
+    signature = _langfuse_config()
+    if _langfuse_checked and _langfuse_signature == signature:
         return _langfuse
 
     with _langfuse_lock:
-        if _langfuse_checked:
+        signature = _langfuse_config()
+        if _langfuse_checked and _langfuse_signature == signature:
             return _langfuse
-
-        secret = os.getenv('LANGFUSE_SECRET_KEY', '').strip()
-        public = os.getenv('LANGFUSE_PUBLIC_KEY', '').strip()
-
+        _langfuse_signature = signature
+        _langfuse = None
+        public, secret, host = signature
         if not secret or not public:
-            logger.warning("Langfuse credentials missing")
+            logger.warning('Langfuse credentials missing')
             _langfuse_checked = True
             return None
-
-        host = (
-            os.getenv('LANGFUSE_HOST')
-            or os.getenv('LANGFUSE_BASE_URL')
-            or 'http://127.0.0.1:3030'
-        ).rstrip('/')
-
         try:
             from langfuse import Langfuse
             try:
@@ -114,11 +127,9 @@ def get_langfuse():
             except TypeError:
                 _langfuse = Langfuse(secret_key=secret, public_key=public, host=host)
             logger.info('Langfuse initialized: %s', host)
-
         except Exception:
-            logger.exception("Langfuse initialization failed")
+            logger.exception('Langfuse initialization failed')
             _langfuse = None
-
         finally:
             _langfuse_checked = True
 

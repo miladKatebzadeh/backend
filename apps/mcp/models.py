@@ -38,7 +38,7 @@ def get_setting(key, default=''):
         return default
     if value is None or value == '':
         return default
-    if key == 'jenkins_token':
+    if key in ('jenkins_token', 'langfuse_secret_key'):
         from apps.mcp.secrets import decrypt_secret
         return decrypt_secret(value) or default
     return value
@@ -46,7 +46,7 @@ def get_setting(key, default=''):
 
 def set_setting(key, value):
     stored = str(value)
-    if key == 'jenkins_token' and stored:
+    if key in ('jenkins_token', 'langfuse_secret_key') and stored:
         from apps.mcp.secrets import encrypt_secret
         stored = encrypt_secret(stored)
     SystemSetting.objects.update_or_create(key=key, defaults={'value': stored})
