@@ -345,12 +345,12 @@ def retrieve_runbooks(query, incident_family=None, limit=3):
         if len(selected) >= limit:
             break
 
-    candidate_sources = {item["retrieval_source"] for item in candidates}
-    if candidate_sources == {"chroma", "postgres"}:
+    selected_sources = {item["retrieval_source"] for item in selected}
+    if selected_sources == {"chroma", "postgres"}:
         source = "hybrid"
-    elif candidate_sources == {"chroma"}:
+    elif selected_sources == {"chroma"}:
         source = "chroma"
-    elif candidate_sources == {"postgres"}:
+    elif selected_sources == {"postgres"}:
         source = "postgres_fallback"
     else:
         source = "none"
