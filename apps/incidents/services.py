@@ -205,7 +205,7 @@ def sync_incidents_from_telemetry() -> dict:
     jenkins_rows = _latest_by(
         JenkinsBuild.objects.all(),
         lambda row: row.job_name,
-        ('-updated_at', '-build_number', '-id'),
+        ('-build_number', '-updated_at', '-id'),
     )
     for row in jenkins_rows:
         resource = row.job_name
