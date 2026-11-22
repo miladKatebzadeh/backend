@@ -489,11 +489,12 @@ def _laya_boolean(target, threshold):
         choice = target.get('choice')
         if isinstance(choice, bool):
             return choice
-        choice_text = str(choice or '').strip().lower()
-        if choice_text in true_values:
-            return True
-        if choice_text in false_values:
-            return False
+        if choice is not None:
+            choice_text = str(choice).strip().lower()
+            if choice_text in true_values:
+                return True
+            if choice_text in false_values:
+                return False
         raw = target.get('noul', target.get('probability_true', target.get('probability')))
     else:
         if isinstance(target, bool):
