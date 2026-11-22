@@ -135,9 +135,10 @@ class DocumentViewSet(viewsets.ModelViewSet):
             )
 
         runbook_id = str(front_matter.get('id') or '').strip()
+        runbook_slug = slugify(runbook_id) if runbook_id else ''
         external_id = (
-            f"runbook_{slugify(runbook_id)[:160]}"
-            if runbook_id
+            f"runbook_{runbook_slug[:160]}"
+            if runbook_slug
             else f'ext_{uuid.uuid4().hex[:12]}'
         )
         document = KnowledgeDocument.objects.filter(
