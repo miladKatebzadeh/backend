@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     'apps.mcp',
     'apps.knowledge',
     'apps.audit',
+    'apps.incidents.apps.IncidentsConfig',
     'apps.collector.apps.CollectorConfig',
 ]
 MIDDLEWARE = [

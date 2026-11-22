@@ -88,3 +88,61 @@ class DockerApiCollectorTests(TestCase):
         self.assertEqual(disk.alert_status, 'FIRING')
         self.assertEqual(cpu.metric_type, 'prometheus_alert')
         self.assertEqual(cpu.alert_status, 'FIRING')
+
+
+
+class FiringAlertLifecycleTests(TestCase):
+    def test_successful_empty_provider_poll_marks_previous_alerts_normal(self):
+        from apps.collector.models import PrometheusAlert
+        from apps.mcp.models import set_setting
+
+        set_setting('alertmanager_url', 'http://10.0.0.8:9093')
+        prometheus = PrometheusAlert.objects.create(
+            metric_name='alert:HighCPU',
+            metric_type='prometheus_alert',
+            alert_status='FIRING',
+        )
+        alertmanager = PrometheusAlert.objects.create(
+            metric_name='alert:DiskLow',
+            metric_type='alertmanager',
+            alert_status='FIRING',
+        )
+
+        class Response:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+            def raise_for_status(self):
+                return None
+
+        def fake_get(url, params=None, timeout=None):
+            if url.endswith('/api/v1/alerts'):
+                return Response({'data': {'alerts': []}})
+            if url.endswith('/api/v2/alerts'):
+                return Response([])
+            raise AssertionError(url)
+
+        with patch('apps.collector.tasks.requests.get', side_effect=fake_get):
+            StandaloneCollectorDaemon._collect_firing_alerts('http://10.0.0.8:9090')
+
+        prometheus.refresh_from_db()
+        alertmanager.refresh_from_db()
+        self.assertEqual(prometheus.alert_status, 'NORMAL')
+        self.assertEqual(alertmanager.alert_status, 'NORMAL')
+
+    def test_provider_failure_does_not_clear_existing_alert(self):
+        from apps.collector.models import PrometheusAlert
+
+        existing = PrometheusAlert.objects.create(
+            metric_name='alert:HighCPU',
+            metric_type='prometheus_alert',
+            alert_status='FIRING',
+        )
+        with patch('apps.collector.tasks.requests.get', side_effect=ConnectionError('provider unavailable')):
+            StandaloneCollectorDaemon._collect_firing_alerts('http://10.0.0.8:9090')
+
+        existing.refresh_from_db()
+        self.assertEqual(existing.alert_status, 'FIRING')
