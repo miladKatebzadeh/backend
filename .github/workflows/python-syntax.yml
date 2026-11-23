@@ -17,3 +17,23 @@ jobs:
           python-version: '3.12'
       - name: Compile Django source
         run: python -m compileall -q apps config manage.py
+
+  diagnostics-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install minimal Django diagnostic dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "Django>=5.1,<6.0" "djangorestframework>=3.15" "django-cors-headers>=4.4" "requests>=2.32" "PyYAML>=6.0" "python-dotenv>=1.0"
+      - name: Run source and incident regression suite (SQLite)
+        env:
+          OPSHUB_DISABLE_LAYA: '1'
+          OPSHUB_DISABLE_COLLECTOR: '1'
+        run: |
+          python manage.py check
+          python manage.py test apps.mcp.tests_source_evidence apps.mcp.tests_incident_context apps.mcp.tests_diagnostic_reporting apps.mcp.tests_trace_presentation --noinput
