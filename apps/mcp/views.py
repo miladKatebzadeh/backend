@@ -322,6 +322,7 @@ def mcp_ai_chat(request):
         'status': incident.status,
         'severity': incident.severity,
         'incident_id': incident.pk,
+        'snapshot': incident.metadata if isinstance(incident.metadata, dict) else {},
     } if incident is not None else None)
     routing_message = (
         f"{incident.source} {incident.title}. {incident.description[:350]}"
