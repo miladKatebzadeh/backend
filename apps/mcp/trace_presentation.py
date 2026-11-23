@@ -213,6 +213,7 @@ def diagnosis_view(reply_text, engine_status, monitoring_override=False):
         ] if isinstance(parsed.get("evidence_refs"), list) else [],
         "suggested_tool": safe_text(parsed.get("tool_name"), 120) or None,
         "suggested_target": safe_text(parsed.get("tool_target"), 120) or None,
+        "ollama_error": trace_data(parsed.get("ollama_error")) if isinstance(parsed.get("ollama_error"), dict) else None,
     }
 
 
