@@ -148,7 +148,7 @@ class TracePresentationTests(SimpleTestCase):
             "token": "very-secret",
             "extra": {
                 "authorization": "Bearer also-secret",
-                "notes": "error token=another-secret",
+                "notes": "error token=another-secret DB_PASSWORD=database-secret LANGFUSE_SECRET_KEY=langfuse-secret",
                 "url": "https://operator:password@example.net/path",
                 "long": "x" * 2000,
             },
@@ -158,6 +158,8 @@ class TracePresentationTests(SimpleTestCase):
         self.assertNotIn("very-secret", serialized)
         self.assertNotIn("also-secret", serialized)
         self.assertNotIn("another-secret", serialized)
+        self.assertNotIn("database-secret", serialized)
+        self.assertNotIn("langfuse-secret", serialized)
         self.assertNotIn("password@example", serialized)
         self.assertIn("[REDACTED]", serialized)
         self.assertIn("[truncated]", serialized)
