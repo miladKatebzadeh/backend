@@ -9,7 +9,9 @@ from datetime import timedelta
 from django.utils import timezone
 
 from apps.collector.models import DockerMetric, JenkinsBuild, PrometheusAlert
-from apps.mcp.jenkins_evidence import analyze_jenkins_console
+from apps.mcp.jenkins_evidence import (
+    analyze_jenkins_console, fetch_jenkins_build_console, select_jenkins_console,
+)
 
 
 _ERROR_LINE = re.compile(
@@ -142,6 +144,31 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
         if str(number or "").isdigit():
             query = query.filter(build_number=int(number))
         rows = list(query.order_by("-updated_at", "-build_number", "-id")[:2])
+
+        # When the saved console contains only npm help/footer lines, Revive
+        # itself re-fetches the exact failing build once per diagnosis.
+        # Never ask an end user to search for debug log paths.
+        if resource_scope.get("incident_id") and str(number or "").isdigit():
+            cached = rows[0] if rows else None
+            saved_info = cached.raw_build_info if cached and isinstance(cached.raw_build_info, dict) else {}
+            previous = saved_info.get("failure_analysis")
+            if not isinstance(previous, dict):
+                previous = analyze_jenkins_console(cached.console_output if cached else snapshot.get("console_excerpt"))
+            if not previous.get("primary_error"):
+                console = fetch_jenkins_build_console(resource, number)
+                if console:
+                    fetched = analyze_jenkins_console(console)
+                    if fetched.get("primary_error"):
+                        fetched["evidence_origin"] = "jenkins_exact_build_refetch"
+                        bounded = select_jenkins_console(console)
+                        if cached:
+                            cached.raw_build_info = {**saved_info, "failure_analysis": fetched}
+                            cached.console_output = bounded
+                            cached.save(update_fields=["raw_build_info", "console_output"])
+                        else:
+                            snapshot = {**snapshot, "failure_analysis": fetched, "console_excerpt": bounded}
+                            resource_scope = {**resource_scope, "snapshot": snapshot}
+
         evidence["ci_pipeline_logs"] = []
         for row in rows:
             build_info = row.raw_build_info if isinstance(row.raw_build_info, dict) else {}
