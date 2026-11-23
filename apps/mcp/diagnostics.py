@@ -893,16 +893,13 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
             if incident_context else container_summary,
     }
     langfuse = get_langfuse()
+    trace_scope = resource_scope if isinstance(resource_scope, dict) else {}
+    trace_alert = incident_context.get('alert') or {}
     trace_metadata = {
         'schema_version': TRACE_SCHEMA,
-        'source': (incident_context.get('alert') or {}).get('source')
-            or (resource_scope or {}).get('source') if isinstance(resource_scope, dict)
-            else (incident_context.get('alert') or {}).get('source'),
-        'resource': (incident_context.get('alert') or {}).get('resource')
-            or (resource_scope or {}).get('resource') if isinstance(resource_scope, dict)
-            else (incident_context.get('alert') or {}).get('resource'),
-        'incident_id': (resource_scope or {}).get('incident_id')
-            if isinstance(resource_scope, dict) else None,
+        'source': trace_alert.get('source') or trace_scope.get('source'),
+        'resource': trace_alert.get('resource') or trace_scope.get('resource'),
+        'incident_id': trace_scope.get('incident_id'),
     }
     handle = _open_trace(
         langfuse,
@@ -1021,10 +1018,24 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
 """
         retry_prompt = system_prompt + '\nThe previous reply was rejected. Return only the JSON object.'
         try:
-            with _child_span(langfuse, 'llm', {'packet': _compact(packet, 1500)}, as_type='generation', model=target_model, parent=parent) as llm_span:
+            with _child_span(langfuse, STAGES['llm'], {
+                'model': target_model,
+                'alert_or_question': trace_input(routing_message or user_message, incident_context, resource_scope)['alert_or_question'],
+                'observed_error_count': len(incident_context.get('errors') or []),
+                'runbooks_considered': [
+                    hit.get('title') for hit in retrieval.get('results', [])[:3]
+                ],
+            }, as_type='generation', model=target_model, parent=parent) as llm_span:
                 reply_text = _chat(ollama_host, target_model, system_prompt, packet)
-                _set_output(llm_span, {'reply': reply_text})
+                _set_output(llm_span, diagnosis_view(
+                    reply_text, 'ok' if _parse_diagnosis(reply_text) else 'invalid'
+                ))
         except Exception as exc:
+            _set_output(llm_span, {
+                'status': 'offline',
+                'summary': 'The model request failed.',
+                'error_type': exc.__class__.__name__,
+            })
             engine_status = 'offline'
             reply_text = json.dumps({
                 'incident_detected': False,
@@ -1037,11 +1048,20 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
             parsed = _parse_diagnosis(reply_text)
             if parsed is None:
                 try:
-                    with _child_span(langfuse, 'llm_retry', {'packet': _compact(packet, 1500)}, as_type='generation', model=target_model, parent=parent) as retry_span:
+                    with _child_span(langfuse, STAGES['llm_retry'], {
+                        'model': target_model, 'reason': 'Initial model response was invalid.'
+                    }, as_type='generation', model=target_model, parent=parent) as retry_span:
                         reply_text = _chat(ollama_host, target_model, retry_prompt, packet)
-                        _set_output(retry_span, {'reply': reply_text})
+                        _set_output(retry_span, diagnosis_view(
+                            reply_text, 'ok' if _parse_diagnosis(reply_text) else 'invalid'
+                        ))
                     parsed = _parse_diagnosis(reply_text)
-                except Exception:
+                except Exception as exc:
+                    _set_output(retry_span, {
+                        'status': 'error',
+                        'summary': 'The retry did not produce a valid model response.',
+                        'error_type': exc.__class__.__name__,
+                    })
                     logger.exception('diagnosis retry failed')
                     parsed = None
             if parsed is None:
@@ -1068,43 +1088,28 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
                     parsed['tool_name'] = ''
                     parsed['tool_target'] = ''
                 reply_text = json.dumps(parsed)
-        if allow_remediation and engine_status == 'ok':
-            allowed_target = resource_scope.get('resource') if isinstance(resource_scope, dict) else None
-            agent = maybe_execute(reply_text, decisions, allowed_target=allowed_target)
-            _confirm_recovery(agent, decisions)
+        with _child_span(langfuse, STAGES['remediation'], {
+            'authorized': bool(allow_remediation),
+            'allowed_target': trace_scope.get('resource'),
+        }, parent=parent) as action_span:
+            if allow_remediation and engine_status == 'ok':
+                allowed_target = trace_scope.get('resource')
+                agent = maybe_execute(reply_text, decisions, allowed_target=allowed_target)
+                _confirm_recovery(agent, decisions)
+            _set_output(action_span, remediation_view(allow_remediation, agent))
     finally:
-        _close_trace(handle, {
-            'engine_status': engine_status,
-            'incident_context': {
-                'alert': incident_context.get('alert'),
-                'errors': incident_context.get('errors'),
-                'evidence_status': incident_context.get('evidence_status'),
-            },
-            'laya': route_view,
-            'runbook_retrieval': {
-                'query': query,
-                'retrieval_source': retrieval.get('source'),
-                'candidate_count': retrieval.get('candidate_count'),
-                'filters': retrieval.get('filters'),
-                'hits': [
-                    {
-                        'title': hit.get('title'),
-                        'document_id': hit.get('document_id'),
-                        'section': hit.get('section'),
-                        'component': hit.get('component'),
-                        'distance': hit.get('distance'),
-                        'lexical_score': hit.get('lexical_score'),
-                        'relevance_score': hit.get('relevance_score'),
-                        'matched_terms': hit.get('matched_terms'),
-                        'retrieval_source': hit.get('retrieval_source'),
-                    }
-                    for hit in retrieval.get('results', [])
-                ],
-                'runbooks': [_compact(document, 1000) for document in documents[:3]],
-            },
-            'reply': _compact(reply_text, 4000),
-        })
-    return {'reply': reply_text, 'engine_status': engine_status, 'agent_automation': agent, 'decisions': decisions}
+        _close_trace(handle, trace_summary(
+            incident_context, routing_message or user_message,
+            route_view, retrieval, reply_text, engine_status, agent,
+            allow_remediation, query=query,
+        ))
+    return {
+        'reply': reply_text,
+        'engine_status': engine_status,
+        'agent_automation': agent,
+        'decisions': decisions,
+        'trace_id': handle['span'].id if handle else None,
+    }
 
 
 def monitor_incident_daemon():
