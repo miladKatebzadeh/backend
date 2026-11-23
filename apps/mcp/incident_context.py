@@ -269,7 +269,7 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 "updated_at": _timestamp(row.updated_at),
             }
             if can_check_live and index == 0 and str(row.metric_name).startswith("alert:"):
-                details = fetch_active_alert(row.metric_name, source=source)
+                details = fetch_active_alert(row.metric_name, source=source, labels=row.labels)
                 if isinstance(details, dict):
                     entry["alert_detail"] = details
             if can_check_live and index == 0 and not str(row.metric_name).startswith("alert:"):
