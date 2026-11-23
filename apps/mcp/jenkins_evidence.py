@@ -114,35 +114,32 @@ def _command_matches_error(command, error):
 def _analyze_lines(lines):
     records = []
     stage = None
-    command = None
-    command_line = -1000
+    commands = []
     exit_code = None
     for index, raw in enumerate(lines):
         stripped = raw.strip()
         if stripped.startswith("[Pipeline] // stage"):
             stage = None
-            command = None
-            command_line = -1000
+            commands = []
             continue
         match = _STAGE.match(stripped)
         if match:
             stage = _sanitized(match.group(1), 100)
-            command = None
-            command_line = -1000
+            commands = []
         shell = _COMMAND.match(stripped)
         if shell:
-            command = _sanitized(shell.group(1), 230)
-            command_line = index
+            commands.append((index, _sanitized(shell.group(1), 230)))
+            commands = commands[-12:]
         returned = _EXIT.search(stripped)
         if returned:
             exit_code = int(returned.group(1))
         score = _score(stripped)
         if score:
-            linked_command = (
-                command if (0 <= index - command_line <= 25
-                            and _command_matches_error(command, stripped))
-                else None
-            )
+            linked_command = next((
+                previous for position, previous in reversed(commands)
+                if 0 <= index - position <= 50
+                and _command_matches_error(previous, stripped)
+            ), None)
             records.append({
                 "index": index,
                 "score": score,
