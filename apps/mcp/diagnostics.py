@@ -344,6 +344,14 @@ def _child_span(langfuse, name, payload, as_type='span', model=None, parent=None
     trace.children.append(observation)
     try:
         yield observation
+    except Exception as exc:
+        if observation.output is None:
+            _set_output(observation, {
+                'status': 'error',
+                'summary': 'This diagnostic step raised an exception.',
+                'error_type': exc.__class__.__name__,
+            })
+        raise
     finally:
         try:
             observation.end()
@@ -1099,6 +1107,10 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
                 agent = maybe_execute(reply_text, decisions, allowed_target=allowed_target)
                 _confirm_recovery(agent, decisions)
             _set_output(action_span, remediation_view(allow_remediation, agent))
+    except Exception:
+        engine_status = 'error'
+        logger.exception('Incident diagnostic pipeline failed')
+        raise
     finally:
         _close_trace(handle, trace_summary(
             incident_context, routing_message or user_message,
