@@ -17,6 +17,18 @@ from apps.knowledge.retrieval import retrieve_runbooks
 from apps.mcp.incident_context import build_incident_context, retrieval_query_text, routing_context_text
 from apps.mcp.models import MCPTool, get_setting
 from apps.mcp.runtime import MCPSandboxExecutor
+from apps.mcp.trace_presentation import (
+    STAGES,
+    TRACE_SCHEMA,
+    context_view,
+    diagnosis_view,
+    remediation_view,
+    retrieval_view,
+    routing_view,
+    trace_data,
+    trace_input,
+    trace_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,15 +224,16 @@ class _Observation:
 
 
 class _Trace(_Observation):
-    def __init__(self, name, payload):
+    def __init__(self, name, payload, metadata=None):
         super().__init__(name, payload, kind='trace')
         self.children = []
+        self.metadata = metadata or {}
 
 
-def _open_trace(langfuse, name, payload):
+def _open_trace(langfuse, name, payload, metadata=None):
     if langfuse is None:
         return None
-    trace = _Trace(name, payload)
+    trace = _Trace(name, trace_data(payload), metadata=trace_data(metadata or {}))
     return {'span': trace, 'client': langfuse}
 
 
@@ -246,6 +259,8 @@ def _flush_ingestion(client, trace):
         'name': trace.name,
         'input': trace.input,
         'output': trace.output,
+        'metadata': trace.metadata,
+        'tags': ['revive', 'incident-diagnostics', 'trace-v2'],
     })]
     for child in trace.children:
         child.end()
@@ -295,7 +310,7 @@ def _close_trace(handle, output):
         return
     trace = handle['span']
     try:
-        trace.update_trace(output=output)
+        trace.update_trace(output=trace_data(output))
         trace.end()
     except Exception:
         logger.exception('Langfuse trace update failed')
@@ -322,7 +337,7 @@ def _child_span(langfuse, name, payload, as_type='span', model=None, parent=None
         return
     observation = _Observation(
         name,
-        _compact(payload),
+        trace_data(payload),
         kind='generation' if as_type == 'generation' else 'span',
         model=model,
     )
@@ -337,17 +352,11 @@ def _child_span(langfuse, name, payload, as_type='span', model=None, parent=None
 
 
 def _set_output(span, output):
+    """Update only the result. Keep the original span input for causality."""
     if span is None:
         return
-    payload = _compact(output, 8000)
     try:
-        if hasattr(span, 'update'):
-            span.update(input=payload, output=payload)
-    except TypeError:
-        try:
-            span.update(output=payload)
-        except Exception:
-            logger.exception('Langfuse child update failed')
+        span.update(output=trace_data(output))
     except Exception:
         logger.exception('Langfuse child update failed')
 
