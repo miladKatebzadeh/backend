@@ -168,6 +168,53 @@ class JenkinsEvidenceFlowTests(TestCase):
         self.assertNotIn("script returned exit code", query)
         self.assertNotIn("timeout", query)
 
+    @patch("apps.mcp.diagnostics.get_langfuse", return_value=None)
+    @patch("apps.mcp.diagnostics.active_tool_catalog", return_value=[])
+    @patch("apps.mcp.diagnostics.retrieve", return_value={
+        "results": [], "source": "none", "candidate_count": 0, "filters": {},
+    })
+    @patch("apps.mcp.diagnostics.route", return_value={
+        "router": "keywords", "incident_family": "ci_failure",
+        "need_runbook_search": True, "need_ci_logs": True,
+    })
+    @patch("apps.mcp.diagnostics._chat", return_value=json.dumps({
+        "incident_detected": False,
+        "error_scope": "OBSERVED INCIDENT CONTEXT",
+        "diagnostic_report": "No issue was found.",
+        "evidence_refs": [],
+        "user_report": {"summary": "Everything is healthy."},
+        "tool_name": "", "tool_target": "",
+    }))
+    def test_llm_receives_real_error_and_false_negative_is_corrected(
+        self, chat, router, retrieval, tools, langfuse,
+    ):
+        from apps.mcp.diagnostics import diagnose
+
+        JenkinsBuild.objects.create(
+            job_name="CSAI", build_number=6, result="FAILURE",
+            raw_build_info={"failure_analysis": analyze_jenkins_console(SAMPLE_JENKINS_CONSOLE)},
+            console_output=select_jenkins_console(SAMPLE_JENKINS_CONSOLE),
+            updated_at=self.now,
+        )
+        result = diagnose(
+            "Jenkins build #6 failed",
+            resource_scope={"source": "jenkins", "resource": "CSAI", "status": "open"},
+            observed_at=self.now,
+            allow_remediation=False,
+        )
+        self.assertIn("gunicorn", router.call_args.args[0])
+        self.assertIn("gunicorn", retrieval.call_args.args[0])
+        self.assertIn("gunicorn", chat.call_args.args[3])
+        self.assertIn("JENKINS CONSOLE FAILURE ANALYSIS", chat.call_args.args[3])
+        reply = json.loads(result["reply"])
+        self.assertTrue(reply["incident_detected"])
+        self.assertEqual(reply["error_scope"], "ci_failure")
+        self.assertIn("gunicorn", reply["diagnostic_report"])
+        self.assertNotIn("user_report", reply)
+        self.assertIn("gunicorn", result["user_report"]["root_cause"])
+        self.assertNotIn("Everything is healthy", json.dumps(result["user_report"]))
+        self.assertFalse(result["agent_automation"]["agent_triggered"])
+
     def test_source_scoped_historical_snapshot_carries_original_failure(self):
         snapshot = {
             "build_result": "FAILURE",
