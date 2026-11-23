@@ -196,7 +196,7 @@ class EvidenceContextTests(TestCase):
         self.assertEqual(result["decisions"]["incident_family"], "container_runtime")
         payload = json.loads(result["reply"])
         self.assertTrue(payload["incident_detected"])
-        self.assertIn("Monitoring confirms", payload["diagnostic_report"])
+        self.assertIn("سامانه پایش خرابی", payload["diagnostic_report"])
         self.assertNotIn("Everything is healthy", payload["diagnostic_report"])
         self.assertEqual(payload["tool_name"], "")
 
