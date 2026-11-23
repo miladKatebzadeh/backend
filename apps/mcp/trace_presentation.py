@@ -112,6 +112,8 @@ def context_view(context):
                 "root_cause_confirmed": False,
                 "source": group,
                 "source_truncated": bool(candidate.get("source_truncated")),
+                "analysis_version": candidate.get("analyzer_version"),
+                "evidence_origin": candidate.get("evidence_origin") or "stored_jenkins_console",
             }
             break
         if pipeline is not None:
