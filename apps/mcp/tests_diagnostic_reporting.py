@@ -77,7 +77,7 @@ class OllamaDiagnosticsUnitTests(SimpleTestCase):
         report = readable_report(context, raw, "ok")
         self.assertEqual(report["language"], "en")
         self.assertIn("Monitoring", report["summary"])
-        self.assertFalse(any("\\u0600" <= ch <= "\\u06ff"
+        self.assertFalse(any("\u0600" <= ch <= "\u06ff"
                              for ch in json.dumps(report, ensure_ascii=False)))
         self.assertNotIn("check logs", json.dumps(report).lower())
 
