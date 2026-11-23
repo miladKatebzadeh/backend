@@ -968,8 +968,10 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
         try:
             with _child_span(langfuse, 'telemetry', {'route': route_view}, parent=parent) as telemetry_span:
                 # Reuse exactly the same, time-bounded evidence sent to Laya/Chroma.
-                evidence = incident_context['evidence'] if incident_context else gather(
-                    decisions, resource_scope=resource_scope
+                evidence = (
+                    incident_context['evidence'] if incident_context
+                    else {} if isinstance(resource_scope, dict)
+                    else gather(decisions)
                 )
                 _set_output(telemetry_span, {
                     'evidence_status': incident_context.get('evidence_status', 'legacy'),
