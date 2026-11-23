@@ -158,7 +158,7 @@ def _manual_log_handoff(text):
         lowered,
     )) or any(term in lowered for term in (
         "a complete log of this run", "npm help ci", "/tmp/.npm/_logs",
-    )))
+    ))
 
 
 def _jenkins_recommendations(pipeline, defaults):
