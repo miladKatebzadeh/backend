@@ -893,7 +893,23 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
             if incident_context else container_summary,
     }
     langfuse = get_langfuse()
-    handle = _open_trace(langfuse, 'hierarchical_diagnostic_routing', {'incident_raw': user_message})
+    trace_metadata = {
+        'schema_version': TRACE_SCHEMA,
+        'source': (incident_context.get('alert') or {}).get('source')
+            or (resource_scope or {}).get('source') if isinstance(resource_scope, dict)
+            else (incident_context.get('alert') or {}).get('source'),
+        'resource': (incident_context.get('alert') or {}).get('resource')
+            or (resource_scope or {}).get('resource') if isinstance(resource_scope, dict)
+            else (incident_context.get('alert') or {}).get('resource'),
+        'incident_id': (resource_scope or {}).get('incident_id')
+            if isinstance(resource_scope, dict) else None,
+    }
+    handle = _open_trace(
+        langfuse,
+        'Revive | Incident diagnosis',
+        trace_input(routing_message or user_message, incident_context, resource_scope),
+        metadata=trace_metadata,
+    )
     parent = handle['span'] if handle else None
     decisions = {}
     evidence = {}
@@ -905,21 +921,12 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
     reply_text = ''
     agent = {'agent_triggered': False, 'sandbox_output': None}
     try:
-        with _child_span(langfuse, 'incident_context', {
+        with _child_span(langfuse, STAGES['context'], {
             'source': (incident_context.get('alert') or {}).get('source'),
             'resource': (incident_context.get('alert') or {}).get('resource'),
         }, parent=parent) as incident_span:
-            _set_output(incident_span, {
-                'alert': incident_context.get('alert'),
-                'errors': incident_context.get('errors'),
-                'evidence_status': incident_context.get('evidence_status'),
-                'window_minutes': incident_context.get('window_minutes'),
-                'sample_counts': {
-                    key: len(value) for key, value in (incident_context.get('evidence') or {}).items()
-                    if isinstance(value, list)
-                },
-            })
-        with _child_span(langfuse, 'laya', {
+            _set_output(incident_span, context_view(incident_context))
+        with _child_span(langfuse, STAGES['routing'], {
             'message': route_input, 'snapshot': context['fleet_anomaly_snapshot']
         }, parent=parent) as laya_span:
             decisions = route(route_input, context)
@@ -942,40 +949,21 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
                 'need_deployment_changes': bool(decisions.get('need_deployment_changes')),
                 'need_runbook_search': bool(decisions.get('need_runbook_search')),
             }
-            _set_output(laya_span, route_view)
+            _set_output(laya_span, routing_view(route_view))
         query = retrieval_query_text(decisions, incident_context, route_input)
-        with _child_span(langfuse, 'runbook_retrieval', {
+        with _child_span(langfuse, STAGES['retrieval'], {
             'query': query,
             'section': decisions.get('incident_family', 'unknown'),
         }, parent=parent) as retrieval_span:
             retrieval = retrieve(query, decisions)
             hits = retrieval.get('results', [])
             documents = [hit['text'] for hit in hits]
-            _set_output(retrieval_span, {
-                'section': decisions.get('incident_family', 'unknown'),
-                'query': query,
-                'retrieval_source': retrieval.get('source'),
-                'candidate_count': retrieval.get('candidate_count'),
-                'filters': retrieval.get('filters'),
-                'hits': [
-                    {
-                        'title': hit.get('title'),
-                        'document_id': hit.get('document_id'),
-                        'section': hit.get('section'),
-                        'component': hit.get('component'),
-                        'chunk': hit.get('chunk'),
-                        'distance': hit.get('distance'),
-                        'lexical_score': hit.get('lexical_score'),
-                        'relevance_score': hit.get('relevance_score'),
-                        'matched_terms': hit.get('matched_terms'),
-                        'retrieval_source': hit.get('retrieval_source'),
-                    }
-                    for hit in hits
-                ],
-                'runbooks': [_compact(document, 1000) for document in documents[:3]],
-            })
+            _set_output(retrieval_span, retrieval_view(query, retrieval))
         try:
-            with _child_span(langfuse, 'telemetry', {'route': route_view}, parent=parent) as telemetry_span:
+            with _child_span(langfuse, STAGES['telemetry'], {
+                'selected_family': decisions.get('incident_family'),
+                'evidence_origin': incident_context.get('evidence_status', 'legacy'),
+            }, parent=parent) as telemetry_span:
                 # Reuse exactly the same, time-bounded evidence sent to Laya/Chroma.
                 evidence = (
                     incident_context['evidence'] if incident_context
@@ -983,7 +971,11 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
                     else gather(decisions)
                 )
                 _set_output(telemetry_span, {
-                    'evidence_status': incident_context.get('evidence_status', 'legacy'),
+                    'status': incident_context.get('evidence_status', 'legacy'),
+                    'summary': (
+                        context_view(incident_context)['summary'] if incident_context
+                        else 'Legacy telemetry gathered; no linked Incident context was supplied.'
+                    ),
                     'sample_counts': {
                         key: len(value) for key, value in evidence.items() if isinstance(value, list)
                     },
