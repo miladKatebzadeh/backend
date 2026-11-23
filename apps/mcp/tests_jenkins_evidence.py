@@ -195,6 +195,37 @@ class JenkinsEvidenceFlowTests(TestCase):
         self.assertIn("gunicorn", trace["pipeline_failure"]["primary_error"])
         self.assertEqual(trace["pipeline_failure"]["failing_stage"], "Deploy Container")
 
+    @patch("apps.mcp.incident_context.fetch_jenkins_build_console")
+    def test_stale_old_parser_false_positive_triggers_refetch(self, fetch):
+        footer = "npm error A complete log of this run can be found in: /tmp/debug.log"
+        JenkinsBuild.objects.create(
+            job_name="CSAI", build_number=6, result="FAILURE",
+            raw_build_info={"failure_analysis": {
+                "primary_error": footer,
+                "diagnostic_status": "specific_error_found",
+                "error_lines": [footer],
+            }},
+            console_output=footer,
+            updated_at=self.now,
+        )
+        fetch.return_value = "\\n".join([
+            "[Pipeline] { (Frontend tests)",
+            "+ npm ci",
+            "npm error code EUSAGE",
+            "npm error npm ci cannot install packages when package-lock.json is outdated.",
+            footer,
+        ])
+        context = build_incident_context(
+            "CSAI #6 failed",
+            {"source": "jenkins", "resource": "CSAI", "status": "open",
+             "incident_id": 42, "snapshot": {"build_number": 6}},
+            observed_at=self.now,
+        )
+        fetch.assert_called_once_with("CSAI", 6)
+        error = context["evidence"]["ci_pipeline_logs"][0]["failure_analysis"]["primary_error"]
+        self.assertNotIn("A complete log", error)
+        self.assertIn("package-lock.json", error)
+
     def test_build_number_scope_excludes_another_failure_in_same_job(self):
         JenkinsBuild.objects.create(
             job_name="CSAI", build_number=6, result="FAILURE",
