@@ -1149,17 +1149,21 @@ explicitly say that no matching Runbook was found.
                     parsed['incident_detected'] = True
                     found_error = pipeline_failure.get('primary_error') if pipeline_failure else None
                     failed_stage = pipeline_failure.get('failing_stage') if pipeline_failure else None
-                    actual_error = (
-                        f" Observed Jenkins console error: {found_error}."
-                        f" Pipeline stage: {failed_stage or 'unknown'}."
-                        if found_error else " No specific failure message was found in the collected logs."
-                    )
+                    if alert.get('source') == 'jenkins':
+                        actual_error = (
+                            f" خطای ثبت‌شده در کنسول: {str(found_error)[:260]}."
+                            f" مرحله Pipeline: {failed_stage or 'نامشخص'}."
+                            if found_error else
+                            " لاگ فعلی تنها شکست Build را نشان می‌دهد و خطای مشخصی پیدا نشد."
+                        )
+                    else:
+                        actual_error = ""
                     parsed['diagnostic_report'] = (
-                        f"Monitoring confirms an active incident for {alert.get('source')}:"
-                        f"{alert.get('resource')} (status: {observed_status})."
+                        f"سامانه پایش خرابی {alert.get('resource')} "
+                        f"در {alert.get('source')} را تأیید کرده است (وضعیت: {observed_status})."
                         + actual_error +
-                        " The diagnostic model did not establish a verified root cause. "
-                        "Review the failure context and verify recovery manually."
+                        " هوش مصنوعی علت ریشه‌ای را با اطمینان تعیین نکرده است؛ "
+                        "شواهد مربوطه را بررسی و سپس بازیابی سرویس را تأیید کنید."
                     )
                     parsed['error_scope'] = decisions.get('incident_family') or 'engine'
                     # Discard a contradictory model-authored report when the model
