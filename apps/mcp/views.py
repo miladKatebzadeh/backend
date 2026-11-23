@@ -343,6 +343,7 @@ def mcp_ai_chat(request):
         'laya_model': decisions.get('laya_model', ''),
         'action': _action_payload(result),
         'incident_id': incident.pk if incident is not None else None,
+        'trace_id': result.get('trace_id'),
     })
 
 
