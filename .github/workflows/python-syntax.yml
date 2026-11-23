@@ -34,6 +34,8 @@ jobs:
         env:
           OPSHUB_DISABLE_LAYA: '1'
           OPSHUB_DISABLE_COLLECTOR: '1'
+          DB_ENGINE: django.db.backends.sqlite3
+          DB_NAME: /tmp/revive-ci.sqlite3
         run: |
           python manage.py check
           python manage.py test apps.mcp.tests_source_evidence apps.mcp.tests_incident_context apps.mcp.tests_diagnostic_reporting apps.mcp.tests_trace_presentation --noinput
