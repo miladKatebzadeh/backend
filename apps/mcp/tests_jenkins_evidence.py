@@ -9,7 +9,9 @@ from django.utils import timezone
 from apps.collector.models import JenkinsBuild
 from apps.collector.tasks import StandaloneCollectorDaemon
 from apps.mcp.incident_context import build_incident_context, retrieval_query_text, routing_context_text
-from apps.mcp.jenkins_evidence import analyze_jenkins_console, select_jenkins_console
+from apps.mcp.jenkins_evidence import (
+    analyze_jenkins_console, select_jenkins_console, fetch_jenkins_build_console,
+)
 from apps.mcp.trace_presentation import context_view
 
 
@@ -142,6 +144,36 @@ class JenkinsLogParserTests(SimpleTestCase):
         self.assertEqual(parsed["failing_command"], "npm ci")
         self.assertNotIn("/tmp/debug", str(parsed["error_lines"]))
         self.assertNotIn("git rev-parse", str(parsed["failing_command"]))
+
+    @patch("apps.mcp.jenkins_evidence.requests.get")
+    @patch("apps.mcp.models.get_setting")
+    def test_exact_jenkins_console_fetch_is_read_only_scoped_and_authenticated(
+        self, setting, request,
+    ):
+        lookup = {
+            "jenkins_url": "https://jenkins.example.org",
+            "jenkins_user": "ci-readonly",
+            "jenkins_token": "example-token",
+        }
+        setting.side_effect = lambda key, default=None: lookup.get(key, default)
+
+        class Response:
+            text = "npm error code EUSAGE"
+            def raise_for_status(self):
+                pass
+
+        request.return_value = Response()
+        console = fetch_jenkins_build_console("folder/CSAI", 6)
+        self.assertIn("EUSAGE", console)
+        self.assertEqual(
+            request.call_args.args[0],
+            "https://jenkins.example.org/job/folder/job/CSAI/6/consoleText",
+        )
+        self.assertEqual(request.call_args.kwargs["auth"], ("ci-readonly", "example-token"))
+        self.assertFalse(request.call_args.kwargs.get("data"))
+        request.reset_mock()
+        self.assertIsNone(fetch_jenkins_build_console("CSAI", "not-a-build"))
+        request.assert_not_called()
 
     def test_compiler_failure_is_specific_not_wrapper(self):
         source = "\n".join([
