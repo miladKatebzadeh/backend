@@ -847,10 +847,11 @@ def _confirm_recovery(agent, decisions):
     agent['resolved'] = state == 'running'
 
 
-def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=None) -> dict:
+def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=None, routing_message=None) -> dict:
     user_message = (user_message or '').strip()
     if not user_message:
         return {'reply': '', 'engine_status': 'error', 'agent_automation': {'agent_triggered': False}, 'detail': 'empty'}
+    route_input = (routing_message or user_message).strip()
 
     ollama_host = get_setting('ollama_host', os.getenv('OLLAMA_HOST', 'http://localhost:11434'))
     target_model = get_setting('ollama_model', os.getenv('OLLAMA_MODEL', 'qwen2.5-coder:7b'))
@@ -883,8 +884,8 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
     reply_text = ''
     agent = {'agent_triggered': False, 'sandbox_output': None}
     try:
-        with _child_span(langfuse, 'laya', {'message': user_message, 'snapshot': container_summary}, parent=parent) as laya_span:
-            decisions = route(user_message, context)
+        with _child_span(langfuse, 'laya', {'message': route_input, 'snapshot': container_summary}, parent=parent) as laya_span:
+            decisions = route(route_input, context)
             route_view = {
                 'router': decisions.get('router', 'keywords'),
                 'laya_model': decisions.get('laya_model', ''),
@@ -896,7 +897,7 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
                 'need_runbook_search': bool(decisions.get('need_runbook_search')),
             }
             _set_output(laya_span, route_view)
-        query = runbook_query(decisions, user_message)
+        query = runbook_query(decisions, route_input)
         with _child_span(langfuse, 'runbook_retrieval', {
             'query': query,
             'section': decisions.get('incident_family', 'unknown'),
