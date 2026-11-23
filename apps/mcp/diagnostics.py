@@ -1067,6 +1067,7 @@ explicitly say that no matching Runbook was found.
                 'ollama_error': ollama_error,
             })
             engine_status = 'offline'
+            monitoring_override = observed_incident(incident_context)
             reply_text = offline_diagnosis(incident_context, ollama_error)
         if engine_status == 'ok':
             parsed = _parse_diagnosis(reply_text)
@@ -1095,10 +1096,25 @@ explicitly say that no matching Runbook was found.
                     parsed = None
             if parsed is None:
                 if engine_status == 'offline':
+                    monitoring_override = observed_incident(incident_context)
                     reply_text = offline_diagnosis(incident_context, ollama_error)
                 else:
                     engine_status = 'invalid'
-                    reply_text = _invalid_diagnosis()
+                    if observed_incident(incident_context):
+                        monitoring_override = True
+                        reply_text = json.dumps({
+                            'incident_detected': True,
+                            'error_scope': (incident_context.get('alert') or {}).get('family') or 'engine',
+                            'engine_status': 'invalid',
+                            'diagnostic_report': (
+                                'سامانه پایش وجود خرابی را تأیید کرده، اما خروجی مدل قابل اعتبارسنجی نیست. '
+                                'علت اصلی هنوز مشخص نشده است. ابتدا شواهد و لاگ‌های مرتبط را بررسی کنید.'
+                            ),
+                            'evidence_refs': ['monitored incident alert'],
+                            'tool_name': '', 'tool_target': '',
+                        }, ensure_ascii=False)
+                    else:
+                        reply_text = _invalid_diagnosis()
             else:
                 # The Incident ledger / source alert is independent monitoring
                 # evidence. A false model classification cannot erase it.
