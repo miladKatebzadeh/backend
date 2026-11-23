@@ -147,6 +147,7 @@ def context_view(context):
         },
         "correlation_window_minutes": context.get("window_minutes"),
         "pipeline_failure": pipeline,
+        "source_assessment": trace_data(context.get("source_assessment")) if context.get("source_assessment") else None,
     }
 
 
@@ -294,6 +295,9 @@ def trace_summary(context, message, route, retrieval, reply_text, engine_status,
             "observed_errors": [error["message"] for error in observed["observed_errors"]],
             "pipeline_primary_error": (observed.get("pipeline_failure") or {}).get("primary_error"),
             "pipeline_stage": (observed.get("pipeline_failure") or {}).get("failing_stage"),
+            "source_issue": (observed.get("source_assessment") or {}).get("issue"),
+            "source_primary_error": (observed.get("source_assessment") or {}).get("primary_error"),
+            "evidence_origin": (observed.get("source_assessment") or {}).get("evidence_origin"),
             "routing": routed["summary"],
             "runbooks": searched["summary"],
             "ai_assessment": diagnosis["assessment"] or diagnosis["summary"],
