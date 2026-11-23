@@ -297,19 +297,32 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
                 "Revive could not identify a specific cause from the available console output."
             )
     if model_ok:
+        # A convincing LLM explanation is NOT evidence. If Jenkins returned
+        # only npm help text, do not allow the model to invent a specific cause.
+        no_specific_jenkins_error = bool(
+            source == "jenkins" and pipeline_failure
+            and not pipeline_failure.get("primary_error")
+        )
         model_summary = model_report.get("summary") or parsed.get("diagnostic_report")
-        if _english(model_summary) and not _manual_log_handoff(model_summary):
+        if (
+            not no_specific_jenkins_error and _english(model_summary)
+            and not _manual_log_handoff(model_summary)
+        ):
             summary = safe_text(model_summary, 1050)
         suggested_cause = model_report.get("likely_cause")
-        if _english(suggested_cause) and suggested_cause.strip().lower() not in ("unknown", "n/a", "none"):
+        if (
+            not no_specific_jenkins_error and _english(suggested_cause)
+            and suggested_cause.strip().lower() not in ("unknown", "n/a", "none")
+            and not _manual_log_handoff(suggested_cause)
+        ):
             root_cause = "AI hypothesis (not yet verified): " + safe_text(suggested_cause, 430)
         proposed_steps = _list_of_text(model_report.get("recommended_steps"), limit=5)
         proposed_checks = _list_of_text(model_report.get("verification_steps"), limit=4)
         usable_steps = [step for step in proposed_steps if _english(step) and not _manual_log_handoff(step)]
         usable_checks = [check for check in proposed_checks if _english(check) and not _manual_log_handoff(check)]
-        if usable_steps:
+        if usable_steps and not no_specific_jenkins_error:
             steps = usable_steps
-        if usable_checks:
+        if usable_checks and not no_specific_jenkins_error:
             verification = usable_checks
         report_status = "ai_assessment"
         ai_note = "AI assessment is available. The proposed cause and recovery remain unverified until monitored evidence confirms them."
