@@ -8,8 +8,6 @@ import math
 import os
 import re
 from datetime import timedelta
-from urllib.parse import quote
-
 import requests
 from django.utils import timezone
 
@@ -202,6 +200,11 @@ def analyze_metric_observation(metric, window=None):
     elif name.startswith("alert:"):
         alertname = _safe(labels.get("alertname") or name.removeprefix("alert:"), 110)
         issue = f"The {alertname} alert is recorded as {status}."
+        detail = row.get("alert_detail") if isinstance(row.get("alert_detail"), dict) else {}
+        if detail.get("status") == "observed":
+            description = _safe(detail.get("summary") or detail.get("description"), 240)
+            if description:
+                issue += f" Monitoring provider details: {description}"
         category = "firing_alert"
         steps = "Apply the resolution specific to the alert's verified condition and affected resource."
     else:
@@ -220,7 +223,12 @@ def analyze_metric_observation(metric, window=None):
         "labels": {str(k)[:60]: _safe(v, 100) for k, v in list(labels.items())[:12]},
         "recommended_direction": steps,
         "time_window": range_data,
-        "evidence_origin": "collector_and_prometheus_range" if range_data.get("status") == "observed" else "stored_metric_sample",
+        "evidence_origin": (
+            "collector_and_prometheus_range" if range_data.get("status") == "observed"
+            else "collector_and_active_alert" if isinstance(row.get("alert_detail"), dict)
+            and row["alert_detail"].get("status") == "observed"
+            else "stored_metric_sample"
+        ),
         "root_cause_confirmed": False,
     }
 
