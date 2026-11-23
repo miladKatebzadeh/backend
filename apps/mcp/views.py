@@ -282,12 +282,36 @@ def _action_payload(result):
 
 @decorators.api_view(['POST'])
 def mcp_ai_chat(request):
-    user_message = (request.data.get('message') or '').strip()
-    if not user_message:
+    message = request.data.get('message')
+    if not isinstance(message, str) or not message.strip():
         return response.Response({'detail': 'Message payload cannot be empty.'}, status=400)
+    user_message = message.strip()
+    if len(user_message) > 4000:
+        return response.Response({'detail': 'Message must be at most 4000 characters.'}, status=400)
+
+    history = request.data.get('history', [])
+    if not isinstance(history, list) or len(history) > 40:
+        return response.Response({'detail': 'History must be a list of at most 40 turns.'}, status=400)
+
+    incident = None
+    incident_id = request.data.get('incident_id')
+    if incident_id is not None:
+        if isinstance(incident_id, bool) or not str(incident_id).strip().isdigit() or int(incident_id) <= 0:
+            return response.Response({'detail': 'incident_id must be a positive integer.'}, status=400)
+
+        from django.shortcuts import get_object_or_404
+        from apps.incidents.models import Incident
+        from apps.mcp.incident_chat import compose_incident_chat_prompt
+
+        incident = get_object_or_404(Incident, pk=int(incident_id))
+        user_message = compose_incident_chat_prompt(incident, user_message, history)
+
     auto = _wants_remediation(get_setting('auto_remediate', '0'))
     requested = _wants_remediation(request.data.get('remediate', ''))
-    result = diagnose(user_message, allow_remediation=auto or requested)
+    # Opening an Incident chat is diagnosis, not approval to execute a tool.
+    # Incident-linked calls need an explicit remediation flag, even if auto mode is on.
+    allow_remediation = requested if incident is not None else (auto or requested)
+    result = diagnose(user_message, allow_remediation=allow_remediation)
     decisions = result.get('decisions') or {}
     return response.Response({
         'reply': result['reply'],
@@ -295,6 +319,7 @@ def mcp_ai_chat(request):
         'router': decisions.get('router', 'keywords'),
         'laya_model': decisions.get('laya_model', ''),
         'action': _action_payload(result),
+        'incident_id': incident.pk if incident is not None else None,
     })
 
 
