@@ -137,6 +137,13 @@ class TracePresentationTests(SimpleTestCase):
         })
         self.assertEqual(attempted["status"], "executed_unverified")
         self.assertFalse(attempted["recovery_verified"])
+        unexpected = remediation_view(False, {
+            "agent_triggered": True, "matched_tool": "restart_container",
+            "sandbox_output": {"success": True}, "resolved": False,
+        })
+        self.assertTrue(unexpected["tool_executed"])
+        self.assertFalse(unexpected["authorized"])
+        self.assertEqual(unexpected["status"], "executed_unverified")
         verified = remediation_view(True, {
             "agent_triggered": True, "sandbox_output": {"success": True},
             "resolved": True, "proof": "container state",
