@@ -257,6 +257,9 @@ def trace_summary(context, message, route, retrieval, reply_text, engine_status,
     remediation = remediation_view(allow_remediation, agent)
     return {
         "schema_version": TRACE_SCHEMA,
+        "engine_status": diagnosis["status"],
+        "incident_detected": diagnosis["incident_detected_in_response"],
+        "recovery_verified": remediation["recovery_verified"],
         "overview": {
             "what_happened": observed["alert"]["message"] or safe_text(message, 300),
             "evidence_status": observed["status"],
