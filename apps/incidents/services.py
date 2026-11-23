@@ -256,6 +256,10 @@ def sync_incidents_from_telemetry() -> dict:
             metadata={
                 'build_number': row.build_number,
                 'build_result': result,
+                'failure_analysis': (
+                    (row.raw_build_info or {}).get('failure_analysis')
+                    if isinstance(row.raw_build_info, dict) else None
+                ),
                 'console_excerpt': _excerpt(row.console_output),
             },
         )

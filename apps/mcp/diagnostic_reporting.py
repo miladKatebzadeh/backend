@@ -185,7 +185,40 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
         title = "گزارش بررسی زیرساخت"
         summary = "درخواست برای تحلیل وضعیت سیستم دریافت شد."
 
+    pipeline_failure = None
+    for group in ("ci_pipeline_logs", "incident_record_snapshot"):
+        for item in (context.get("evidence") or {}).get(group, []):
+            if isinstance(item, dict) and isinstance(item.get("failure_analysis"), dict):
+                pipeline_failure = item["failure_analysis"]
+                break
+        if pipeline_failure is not None:
+            break
+
     root_cause = "علت اصلی هنوز با شواهد موجود تأیید نشده است."
+    if source == "jenkins" and pipeline_failure:
+        primary = pipeline_failure.get("primary_error")
+        if isinstance(primary, str) and primary.strip():
+            root_cause = (
+                "خطای مشخص ثبت‌شده در Console: " + safe_text(primary, 350)
+                + ". این پیام مبنای بررسی است؛ علت ریشه‌ای هنوز باید تأیید شود."
+            )
+            stage = pipeline_failure.get("failing_stage")
+            command = pipeline_failure.get("failing_command")
+            if stage:
+                evidence.append({
+                    "text": "مرحله نزدیک به خطا: " + safe_text(stage, 100),
+                    "source": "jenkins_console", "type": "observed",
+                })
+            if command:
+                evidence.append({
+                    "text": "دستور نزدیک به خطا: " + safe_text(command, 230),
+                    "source": "jenkins_console", "type": "observed",
+                })
+        else:
+            root_cause = (
+                "در داده‌های موجود فقط وضعیت شکست Build ثبت شده است. "
+                "پیام پایان Pipeline یا Exit Code به‌تنهایی علت خطا را نشان نمی‌دهد."
+            )
     if model_ok:
         model_summary = model_report.get("summary") or parsed.get("diagnostic_report")
         if isinstance(model_summary, str) and model_summary.strip():
@@ -238,6 +271,12 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
         "ai_status": engine_status,
         "ai_note": ai_note,
         "runbook_count": len(matched),
+        "pipeline_failure": {
+            "diagnostic_status": pipeline_failure.get("diagnostic_status"),
+            "primary_error": safe_text(pipeline_failure.get("primary_error"), 350) or None,
+            "failing_stage": safe_text(pipeline_failure.get("failing_stage"), 110) or None,
+            "failing_command": safe_text(pipeline_failure.get("failing_command"), 220) or None,
+        } if pipeline_failure else None,
         "action": action,
         "recovery_verified": verified,
         "source": "ai_and_monitoring" if model_ok else "monitoring_only",

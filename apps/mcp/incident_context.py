@@ -9,6 +9,7 @@ from datetime import timedelta
 from django.utils import timezone
 
 from apps.collector.models import DockerMetric, JenkinsBuild, PrometheusAlert
+from apps.mcp.jenkins_evidence import analyze_jenkins_console
 
 
 _ERROR_LINE = re.compile(
@@ -129,25 +130,46 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
             for line in entry["log_errors"]:
                 add_error("log_error", line, "docker_logs", row.timestamp)
     elif resource and start <= end and source == "jenkins":
-        rows = list(
-            JenkinsBuild.objects.filter(
-                job_name=resource, updated_at__gte=start, updated_at__lte=end
-            ).order_by("-updated_at", "-build_number", "-id")[:2]
+        # Keep the Incident's exact build, not another failure in the same job
+        # that happened within the correlation time window.
+        snapshot = resource_scope.get("snapshot")
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        number = resource_scope.get("build_number") or snapshot.get("build_number")
+        query = JenkinsBuild.objects.filter(
+            job_name=resource, updated_at__gte=start, updated_at__lte=end
         )
+        if str(number or "").isdigit():
+            query = query.filter(build_number=int(number))
+        rows = list(query.order_by("-updated_at", "-build_number", "-id")[:2])
         evidence["ci_pipeline_logs"] = []
         for row in rows:
+            build_info = row.raw_build_info if isinstance(row.raw_build_info, dict) else {}
+            analysis = build_info.get("failure_analysis")
+            if not isinstance(analysis, dict):
+                analysis = analyze_jenkins_console(row.console_output)
             entry = {
                 "job": row.job_name,
                 "build_number": row.build_number,
                 "result": row.result,
                 "updated_at": _timestamp(row.updated_at),
-                "log_errors": _error_lines(row.console_output),
+                "failure_analysis": analysis,
+                "log_errors": list(analysis.get("error_lines") or [])[:4],
             }
             evidence["ci_pipeline_logs"].append(entry)
+            if analysis.get("primary_error"):
+                add_error("pipeline_error", analysis["primary_error"], "jenkins_console", row.updated_at)
+                for line in entry["log_errors"][1:]:
+                    add_error("log_error", line, "jenkins_console", row.updated_at)
             if row.result in ("FAILURE", "UNSTABLE", "ABORTED"):
                 add_error("build_result", f"Build #{row.build_number} result: {row.result}", "jenkins", row.updated_at)
-            for line in entry["log_errors"]:
-                add_error("log_error", line, "jenkins_console", row.updated_at)
+                if not analysis.get("primary_error") and analysis.get("execution_exit_code") is not None:
+                    add_error(
+                        "exit_status",
+                        f"Shell exited with code {analysis['execution_exit_code']} (root cause unknown)",
+                        "jenkins_console",
+                        row.updated_at,
+                    )
     elif resource and start <= end and source in ("prometheus", "alertmanager"):
         rows = list(
             PrometheusAlert.objects.filter(
@@ -202,15 +224,25 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
             for line in recorded["log_errors"]:
                 add_error("log_error", line, "incident_ledger", observed_at)
         elif source == "jenkins":
+            analysis = snapshot.get("failure_analysis")
+            if not isinstance(analysis, dict):
+                analysis = analyze_jenkins_console(snapshot.get("console_excerpt"))
             recorded.update({
                 "build_number": snapshot.get("build_number"),
                 "result": _redact(snapshot.get("build_result")),
-                "log_errors": _error_lines(snapshot.get("console_excerpt")),
+                "failure_analysis": analysis,
+                "log_errors": list(analysis.get("error_lines") or [])[:4],
             })
+            if analysis.get("primary_error"):
+                add_error("pipeline_error", analysis["primary_error"], "incident_ledger", observed_at)
             if recorded["result"] in ("FAILURE", "UNSTABLE", "ABORTED"):
                 add_error("build_result", f"Build result {recorded['result']}", "incident_ledger", observed_at)
-            for line in recorded["log_errors"]:
-                add_error("log_error", line, "incident_ledger", observed_at)
+            if not analysis.get("primary_error") and analysis.get("execution_exit_code") is not None:
+                add_error(
+                    "exit_status",
+                    f"Shell exited with code {analysis['execution_exit_code']} (root cause unknown)",
+                    "incident_ledger", observed_at,
+                )
         elif source in ("prometheus", "alertmanager"):
             recorded.update({
                 "value": snapshot.get("value"),
@@ -238,6 +270,14 @@ def routing_context_text(incident_context, fallback_message):
         return str(fallback_message or "")
     alert = incident_context["alert"]
     pieces = [alert.get("family") or "", alert.get("message") or ""]
+    for row in (incident_context.get("evidence") or {}).get("ci_pipeline_logs", []):
+        failure = row.get("failure_analysis") or {}
+        if failure.get("primary_error"):
+            pieces.extend([
+                failure.get("failing_stage") or "",
+                failure.get("primary_error") or "",
+            ])
+            break
     pieces.extend(error["message"] for error in incident_context["errors"][:3])
     return _redact(" | ".join(filter(None, pieces)), 850)
 
@@ -249,8 +289,17 @@ def retrieval_query_text(decisions, incident_context, fallback_message):
         return f"{family} {fallback_message}".strip()
     alert = incident_context["alert"]
     parts = [family, str(alert.get("message") or "")[:220]]
+    for row in (incident_context.get("evidence") or {}).get("ci_pipeline_logs", []):
+        failure = row.get("failure_analysis") or {}
+        if failure.get("primary_error"):
+            parts.extend([
+                failure.get("failing_stage") or "",
+                failure.get("primary_error") or "",
+            ])
+            break
     for error in incident_context["errors"][:3]:
-        parts.append(error["message"])
+        if error["kind"] in ("pipeline_error", "log_error", "oom_killed", "state_error", "metric_alert"):
+            parts.append(error["message"])
         if error["kind"] == "oom_killed":
             parts.append("out of memory container OOM")
     return _redact(" ".join(part for part in parts if part), 900)

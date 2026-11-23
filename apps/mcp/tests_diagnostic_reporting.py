@@ -139,9 +139,10 @@ class OllamaDiagnosticsApiTests(TestCase):
         self.assertEqual(result.data["user_report"]["language"], "fa")
         self.assertEqual(result.data["user_report"]["source"], "monitoring_only")
         self.assertFalse(result.data["action"]["triggered"])
-        self.assertIn("ERROR: script returned exit code 1", [
-            e["text"] for e in result.data["user_report"]["evidence"]
-        ])
+        self.assertTrue(any(
+            "root cause unknown" in e["text"]
+            for e in result.data["user_report"]["evidence"]
+        ))
 
     def test_invalid_model_response_does_not_erase_monitoring_failure(self):
         patches = self._diagnosis_context_patches()

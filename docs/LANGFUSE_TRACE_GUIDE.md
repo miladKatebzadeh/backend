@@ -27,6 +27,29 @@ For detailed investigation, expand these numbered spans in order:
 
 Span **input** indicates what that stage received; **output** is the result. They are no longer overwritten with identical data.
 
+## Jenkins Pipeline errors / خطای واقعی Jenkins
+
+For a Jenkins Incident, look under **trace output → incident_evidence → pipeline_failure**:
+
+- `diagnostic_status: specific_error_found`: the Collector identified a substantive error in the Build's console (e.g. `executable file not found`). The actual error, its surrounding lines, nearby shell command and Pipeline stage are recorded separately.
+- `diagnostic_status: only_generic_build_failure`: available data only shows the Build failed. The root cause **remains unknown**; request more complete Jenkins logs instead of guessing.
+- `primary_error`: the precise observed error line; **not** necessarily the underlying verified root cause.
+- `failing_stage` / `failing_command`: context near that error, if Jenkins emitted this information; not necessarily the command that caused the ultimate failure.
+- `error_context`: short, sanitized lines near the selected error to help a human reproduce or investigate it.
+- `execution_exit_code`: exit status of a process, **not** an explanation of why it exited.
+
+`Finished: FAILURE`, `ERROR: script returned exit code 1` and `[Pipeline] // timeout` are generic Jenkins wrappers and will not be promoted to `primary_error` without a substantive error line. A closing `// timeout` block does **not** prove a timeout occurred.
+
+The collector uses bounded, credential-redacted failure windows from the fetched console rather than blindly keeping the final 100 lines. Correlation is scoped to the specific Jenkins job and, when present, the Incident's exact Build number. When historical samples are unavailable, Revive can use the stored Incident snapshot, preserving its provenance.
+
+The routing query for Laya, Runbook retrieval query and Ollama request use the same extracted failure evidence. **Runbook matches are still reference material**, and model-generated hypotheses require independent verification.
+
+**دستور بررسی پس از استقرار:**
+
+```bash
+python manage.py test apps.mcp.tests_jenkins_evidence apps.mcp.tests_incident_context apps.mcp.tests_diagnostic_reporting
+```
+
 ## Critical distinctions / تفاوت‌های مهم
 
 - **`engine_status: ok`**: the diagnostic model returned a usable answer. This does **not** mean the resource recovered.
