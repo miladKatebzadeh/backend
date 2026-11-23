@@ -130,11 +130,18 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
             for line in entry["log_errors"]:
                 add_error("log_error", line, "docker_logs", row.timestamp)
     elif resource and start <= end and source == "jenkins":
-        rows = list(
-            JenkinsBuild.objects.filter(
-                job_name=resource, updated_at__gte=start, updated_at__lte=end
-            ).order_by("-updated_at", "-build_number", "-id")[:2]
+        # Keep the Incident's exact build, not another failure in the same job
+        # that happened within the correlation time window.
+        snapshot = resource_scope.get("snapshot")
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        number = resource_scope.get("build_number") or snapshot.get("build_number")
+        query = JenkinsBuild.objects.filter(
+            job_name=resource, updated_at__gte=start, updated_at__lte=end
         )
+        if str(number or "").isdigit():
+            query = query.filter(build_number=int(number))
+        rows = list(query.order_by("-updated_at", "-build_number", "-id")[:2])
         evidence["ci_pipeline_logs"] = []
         for row in rows:
             build_info = row.raw_build_info if isinstance(row.raw_build_info, dict) else {}
