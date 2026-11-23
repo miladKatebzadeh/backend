@@ -44,6 +44,17 @@ The collector uses bounded, credential-redacted failure windows from the fetched
 
 The routing query for Laya, Runbook retrieval query and Ollama request use the same extracted failure evidence. **Runbook matches are still reference material**, and model-generated hypotheses require independent verification.
 
+### Automatic Jenkins investigation and English reporting
+
+- An `npm error A complete log of this run can be found in...` line, `npm help ci`, and generic npm usage/aliases are **not primary errors**. Specific npm errors such as lockfile mismatches, package version conflicts and missing dependencies outrank these footer lines.
+- The system does not associate an npm failure with an unrelated `git rev-parse` command. It links only nearby compatible commands in the same Pipeline stage.
+- When an Incident-linked Jenkins diagnosis has only generic stored output, Revive makes a **read-only request for that exact job/build console** using its already-configured Jenkins connection. If Jenkins still has actionable details, Revive updates the correlated evidence and its trace. It does not request that the user hunt through log files.
+- Existing persisted summaries created by older parsing logic are reclassified before use. If the Jenkins output cannot be retrieved or contains only generic text, the root cause remains explicitly unknown.
+- User-facing `user_report` defaults to **English** with “What went wrong,” “Recommended resolution,” and “How to verify recovery.” The model is prompted to write clear English and not hand off log reading. The backend uses grounded English fallbacks if model prose is not usable.
+- Neither investigation nor report generation authorizes or executes remediation tools.
+
+The routing query for Laya, Runbook retrieval query and Ollama request use the same extracted failure evidence. **Runbook matches are still reference material**, and model-generated hypotheses require independent verification.
+
 **دستور بررسی پس از استقرار:**
 
 ```bash

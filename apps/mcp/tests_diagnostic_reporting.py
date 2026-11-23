@@ -54,28 +54,93 @@ class OllamaDiagnosticsUnitTests(SimpleTestCase):
         self.assertEqual(report["status"], "ai_unavailable")
         self.assertIn("CSAI", report["title"])
         self.assertIn("exit code 1", report["evidence"][1]["text"])
-        self.assertIn("علت اصلی", report["root_cause"])
+        self.assertIn("root cause", report["root_cause"].lower())
         self.assertTrue(report["recommended_steps"])
         self.assertTrue(report["verification_steps"])
         self.assertFalse(report["recovery_verified"])
         self.assertEqual(report["source"], "monitoring_only")
 
-    def test_model_assessment_is_clearly_a_hypothesis_not_a_verified_fix(self):
+    def test_persian_llm_prose_is_not_forwarded_to_an_english_user_report(self):
         raw = json.dumps({
-            "incident_detected": True, "diagnostic_report": "بررسی محدودیت حافظه",
+            "incident_detected": True, "diagnostic_report": "مشکل را در لاگ بررسی کنید",
             "user_report": {
-                "summary": "احتمالاً حافظه کافی نبوده است.",
-                "likely_cause": "کمبود حافظه",
-                "recommended_steps": ["میزان حافظه را بررسی کنید."],
-                "verification_steps": ["اجرای مجدد سرویس را بررسی کنید."],
+                "summary": "مشکل پیدا شد",
+                "likely_cause": "مشکل حافظه",
+                "recommended_steps": ["لاگ را بررسی کنید"],
+                "verification_steps": ["مرحله بعد را چک کنید"],
             },
         }, ensure_ascii=False)
+        context = {"alert": {
+            "source": "jenkins", "resource": "CSAI",
+            "status": "open", "message": "Build #6 failed",
+        }}
+        report = readable_report(context, raw, "ok")
+        self.assertEqual(report["language"], "en")
+        self.assertIn("Monitoring", report["summary"])
+        self.assertFalse(any("\u0600" <= ch <= "\u06ff"
+                             for ch in json.dumps(report, ensure_ascii=False)))
+        self.assertNotIn("check logs", json.dumps(report).lower())
+
+    def test_english_model_requests_to_read_raw_logs_are_not_surfaced(self):
+        raw = json.dumps({
+            "incident_detected": True,
+            "user_report": {
+                "summary": "Review logs to see why this failed",
+                "likely_cause": "unknown",
+                "recommended_steps": [
+                    "Check the logs in Jenkins",
+                    "Re-run the frontend CI stage after correcting the issue",
+                ],
+            },
+        })
+        context = {"alert": {
+            "source": "jenkins", "resource": "CSAI", "status": "open",
+        }}
+        report = readable_report(context, raw, "ok")
+        self.assertNotIn("review logs", report["summary"].lower())
+        self.assertNotIn("check the logs", json.dumps(report).lower())
+        self.assertIn("Re-run", report["recommended_steps"][0])
+
+    def test_model_cannot_invent_lockfile_cause_from_npm_footer_only(self):
+        ctx = {
+            "alert": {"source": "jenkins", "resource": "CSAI", "status": "open"},
+            "evidence": {"ci_pipeline_logs": [{"failure_analysis": {
+                "diagnostic_status": "insufficient_console_detail",
+                "primary_error": None,
+                "failing_stage": "Frontend tests",
+            }}]},
+        }
+        raw = json.dumps({
+            "incident_detected": True,
+            "diagnostic_report": "The package lock is definitely broken.",
+            "user_report": {
+                "summary": "The package lock is definitely broken.",
+                "likely_cause": "package-lock.json mismatch",
+                "recommended_steps": ["Rewrite the lockfile now."],
+            },
+        })
+        report = readable_report(ctx, raw, "ok")
+        self.assertNotIn("definitely", report["summary"])
+        self.assertNotIn("mismatch", report["root_cause"])
+        self.assertNotIn("Rewrite", json.dumps(report["recommended_steps"]))
+        self.assertIn("could not", report["root_cause"].lower())
+
+    def test_model_assessment_is_clearly_a_hypothesis_not_a_verified_fix(self):
+        raw = json.dumps({
+            "incident_detected": True, "diagnostic_report": "Investigate memory constraints.",
+            "user_report": {
+                "summary": "Insufficient memory may have stopped the container.",
+                "likely_cause": "Memory exhaustion",
+                "recommended_steps": ["Compare measured memory usage to the configured limit."],
+                "verification_steps": ["Confirm the service stays running after recovery."],
+            },
+        })
         ctx = {"alert": {"source": "docker", "resource": "grafana", "status": "exited"}}
         report = readable_report(ctx, raw, "ok")
         self.assertEqual(report["status"], "ai_assessment")
-        self.assertIn("هنوز نیازمند تأیید", report["root_cause"])
+        self.assertIn("not yet verified", report["root_cause"])
         self.assertFalse(report["recovery_verified"])
-        self.assertIn("میزان حافظه", report["recommended_steps"][0])
+        self.assertIn("memory", report["recommended_steps"][0])
 
 
 class OllamaDiagnosticsApiTests(TestCase):
@@ -136,7 +201,7 @@ class OllamaDiagnosticsApiTests(TestCase):
         reply = json.loads(result.data["reply"])
         self.assertTrue(reply["incident_detected"])
         self.assertTrue(result.data["user_report"]["incident_confirmed"])
-        self.assertEqual(result.data["user_report"]["language"], "fa")
+        self.assertEqual(result.data["user_report"]["language"], "en")
         self.assertEqual(result.data["user_report"]["source"], "monitoring_only")
         self.assertFalse(result.data["action"]["triggered"])
         self.assertTrue(any(
@@ -157,16 +222,16 @@ class OllamaDiagnosticsApiTests(TestCase):
         self.assertEqual(result.data["user_report"]["status"], "ai_unusable")
         self.assertFalse(result.data["action"]["triggered"])
 
-    def test_healthy_model_provides_structured_farsi_summary(self):
+    def test_healthy_model_provides_structured_english_summary(self):
         output = json.dumps({
             "incident_detected": True, "error_scope": "ci_failure",
-            "diagnostic_report": "این Build شکست خورده و علت قطعی مشخص نیست.",
+            "diagnostic_report": "The build failed; the exact cause remains unknown.",
             "evidence_refs": ["jenkins_console"],
             "user_report": {
-                "summary": "ساخت پروژه CSAI ناموفق بود.",
-                "likely_cause": "دستور Pipeline با کد ۱ خاتمه یافت",
-                "recommended_steps": ["مرحله ناموفق را در لاگ پیدا کنید."],
-                "verification_steps": ["اجرای موفق Build بعدی را بررسی کنید."],
+                "summary": "The CSAI build failed.",
+                "likely_cause": "An unverified error in the frontend step",
+                "recommended_steps": ["Correct the frontend dependency installation failure."],
+                "verification_steps": ["Confirm the next build succeeds."],
             },
         }, ensure_ascii=False)
         patches = self._diagnosis_context_patches()
@@ -178,6 +243,6 @@ class OllamaDiagnosticsApiTests(TestCase):
         report = result.data["user_report"]
         self.assertIn("CSAI", report["summary"])
         self.assertEqual(report["runbook_count"], 0)
-        self.assertEqual(report["recommended_steps"], ["مرحله ناموفق را در لاگ پیدا کنید."])
-        self.assertIn("نیازمند تأیید", report["root_cause"])
+        self.assertEqual(report["recommended_steps"], ["Correct the frontend dependency installation failure."])
+        self.assertIn("not yet verified", report["root_cause"])
         self.assertFalse(report["recovery_verified"])

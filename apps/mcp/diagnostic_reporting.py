@@ -4,6 +4,7 @@ Monitoring evidence is authoritative about observed failures, while model
 hypotheses are only suggestions. A missing LLM must never erase an Incident.
 """
 import json
+import re
 
 from apps.mcp.trace_presentation import safe_text
 
@@ -31,28 +32,28 @@ def ollama_error_details(exc, model):
     error_type = exc.__class__.__name__
     if status == 404:
         category = "not_found"
-        hint = "نام مدل نصب‌شده و آدرس API سرویس Ollama را بررسی کنید."
+        hint = "Verify the configured Ollama model name and API endpoint."
     elif status in (401, 403):
         category = "unauthorized"
-        hint = "مجوز و تنظیمات اتصال به Ollama را بررسی کنید."
+        hint = "Verify Ollama authorization and connection settings."
     elif status == 400:
         category = "invalid_request"
-        hint = "مدل انتخابی، قالب JSON و پارامترهای درخواست را بررسی کنید."
+        hint = "Verify the model, JSON response format and request parameters."
     elif status == 429:
         category = "capacity"
-        hint = "ظرفیت سرویس و محدودیت هم‌زمانی درخواست‌ها را بررسی کنید."
+        hint = "Review model capacity and request concurrency."
     elif status in (408, 504) or "timeout" in error_type.lower():
         category = "timeout"
-        hint = "مدت پاسخ‌گویی مدل، بار سرویس و تنظیمات Timeout را بررسی کنید."
+        hint = "Review model latency, server load and timeout settings."
     elif status is not None and status >= 500:
         category = "server_error"
-        hint = "لاگ سرویس Ollama، منابع RAM/GPU و وضعیت بارگذاری مدل را بررسی کنید."
+        hint = "Inspect Ollama service health, available RAM/GPU and model loading status."
     elif "connection" in error_type.lower() or "connect" in error_type.lower():
         category = "connection"
-        hint = "دسترسی شبکه از داخل کانتینر Backend به آدرس Ollama را بررسی کنید."
+        hint = "Check network connectivity from the Backend container to Ollama."
     else:
         category = "unknown"
-        hint = "وضعیت سرویس، مدل انتخاب‌شده و لاگ Ollama را بررسی کنید."
+        hint = "Check Ollama availability, configured model and provider diagnostics."
 
     # The SDK may include a provider response body. Truncate and redact it;
     # never include raw exception repr, credentials, traceback or whole prompt.
@@ -75,14 +76,14 @@ def offline_diagnosis(context, error):
     """Backward-compatible JSON reply with monitoring truth, not a false negative."""
     alert = (context or {}).get("alert") or {}
     confirmed = observed_incident(context)
-    resource = safe_text(alert.get("resource") or "سیستم", 100)
-    source = safe_text(alert.get("source") or "پایش", 80)
+    resource = safe_text(alert.get("resource") or "the monitored resource", 100)
+    source = safe_text(alert.get("source") or "monitoring", 80)
     report = (
-        f"خرابی {resource} در {source} توسط سامانه پایش ثبت شده است. "
-        "مدل هوش مصنوعی در حال حاضر پاسخ نداده و علت ریشه‌ای هنوز تأیید نشده است. "
-        "برای ادامه بررسی، شواهد ثبت‌شده و لاگ مربوط به همان منبع را بررسی کنید."
+        f"Monitoring confirmed a failure affecting {resource} in {source}. "
+        "The AI model did not respond; the underlying cause has not been established. "
+        "Revive will explain any failure evidence it already collected, without requiring manual log inspection."
         if confirmed
-        else "پاسخ هوش مصنوعی دریافت نشد. بدون شواهد مستقل نمی‌توان وضعیت سیستم یا علت مشکل را تأیید کرد."
+        else "The AI service is unavailable. Without independent monitoring evidence, the system state remains unverified."
     )
     return json.dumps({
         "incident_detected": confirmed,
@@ -110,38 +111,103 @@ def _list_of_text(value, limit=4, max_chars=230):
 
 
 def _default_steps(source, status):
+    """Operator actions are based on observed facts, not manual log-reading tasks."""
     if source == "jenkins":
         return (
             [
-                "لاگ کامل همان Build را از Jenkins باز کنید و دستور شکست‌خورده و خطوط قبل از Exit Code را بررسی کنید.",
-                "مرحله Pipeline، وابستگی‌ها و تنظیمات محیط اجرای دستور ناموفق را کنترل کنید.",
+                "Address the failing CI stage once Revive identifies the specific error.",
+                "Retry the failed build after a targeted correction; Revive will evaluate the new result.",
             ],
-            ["پس از رفع علت، یک Build جدید اجرا کنید و نتیجه SUCCESS را در Jenkins تأیید کنید."],
+            ["Confirm the next Jenkins build finishes with SUCCESS."],
         )
     if source == "docker":
         return (
             [
-                "لاگ‌ها و وضعیت Docker inspect همان کانتینر را بررسی کنید.",
-                "کد خروج، OOMKilled و محدودیت حافظه را با شواهد واقعی مقایسه کنید.",
+                "Use the observed exit code, OOMKilled state, and container status to choose a targeted correction.",
+                "Apply configuration or resource changes only when the monitoring evidence supports them.",
             ],
-            ["پس از رفع علت، وضعیت running و پایداری کانتینر را دوباره تأیید کنید."],
+            ["Confirm the container is running and remains stable."],
         )
     if source in ("prometheus", "alertmanager"):
         return (
             [
-                "Metric یا Alert مربوط به همان منبع را در بازه زمانی رخداد بررسی کنید.",
-                "مقدارهای قبل و بعد از هشدار و تغییرات مرتبط سرویس را مقایسه کنید.",
+                "Identify the resource and threshold associated with the failing metric.",
+                "Apply a correction only when the observed metric identifies a specific issue.",
             ],
-            ["بازگشت Metric به محدوده طبیعی و پایان هشدار را از منبع پایش تأیید کنید."],
+            ["Confirm the metric returns to its expected range and the alert clears."],
         )
     return (
-        ["لاگ‌ها و شواهد منبع در بازه زمانی Incident را بررسی کنید."],
-        ["پس از اصلاح، سلامت سرویس را با داده پایش مستقل تأیید کنید."],
+        ["Use the observed symptoms to determine a safe, targeted correction."],
+        ["Confirm the service is healthy after any change."],
     )
 
 
+def _english(text):
+    """Do not surface untranslated model-generated prose in English reports."""
+    return isinstance(text, str) and bool(text.strip()) and not any(
+        "\u0600" <= ch <= "\u06ff" for ch in text
+    )
+
+
+def _manual_log_handoff(text):
+    """A diagnostics product must not make the end user research raw logs."""
+    lowered = text.lower()
+    return bool(re.search(
+        r"\b(?:check|review|inspect|open|read|examine|search|look at)\b"
+        r".{0,50}\b(?:logs?|console|trace|debugging output)\b",
+        lowered,
+    )) or any(term in lowered for term in (
+        "a complete log of this run", "npm help ci", "/tmp/.npm/_logs",
+    )))
+
+
+def _jenkins_recommendations(pipeline, defaults):
+    """Offer useful, evidence-conditioned work instead of generic log tasks."""
+    if not isinstance(pipeline, dict):
+        return defaults, None
+    details = " ".join(str(pipeline.get(key) or "") for key in (
+        "primary_error", "error_lines", "error_context",
+    )).lower()
+    stage = safe_text(pipeline.get("failing_stage"), 90) or "the failed CI stage"
+    primary = pipeline.get("primary_error")
+    if not primary:
+        return [
+            f"Revive could not isolate the error in {stage} from the available Jenkins output.",
+            "Re-run the failed stage with its original npm error details printed to the Jenkins console; Revive can analyze the next run automatically.",
+        ], "The build failed, but its console contained no actionable error message."
+    if "package-lock.json" in details and ("npm ci" in details or "npm error" in details):
+        return [
+            "Synchronize package.json and package-lock.json with npm install, then commit the corrected lockfile.",
+            "Re-run the frontend CI dependency installation with npm ci.",
+        ], "Frontend dependency installation appears to have a package-lock.json consistency problem."
+    if "eresolve" in details or "dependency tree" in details or "conflicting peer dependency" in details:
+        return [
+            "Resolve the conflicting package versions in the frontend dependency manifest and lockfile.",
+            "Re-run npm ci and then the frontend test stage.",
+        ], "npm reported a dependency resolution conflict."
+    if "eacces" in details or "permission denied" in details:
+        return [
+            "Correct the CI worker's permissions for the files or directories named by the error.",
+            "Retry the affected Jenkins stage and verify the job succeeds.",
+        ], "The CI process encountered a permissions error."
+    if "gunicorn" in details and "not found" in details:
+        return [
+            "Ensure gunicorn is installed in the backend Docker image and validated during image build.",
+            "Rebuild and redeploy only after the image startup check succeeds.",
+        ], "The runtime could not find the Gunicorn executable."
+    if str(primary).lower().startswith(("npm error", "npm err!")):
+        return [
+            "Use Revive's captured npm failure details to correct the failed frontend installation step.",
+            "Re-run frontend dependency installation and verify the Jenkins build passes.",
+        ], "npm failed during the frontend stage; its exact cause is not yet confirmed."
+    return [
+        f"Correct the problem indicated by the observed error in {stage}.",
+        "Retry the affected stage and verify the Jenkins build succeeds.",
+    ], None
+
+
 def readable_report(incident_context, reply_text, engine_status, agent=None, retrieval=None, error=None):
-    """Create a Persian, evidence-first report for every diagnostic outcome.
+    """Create a plain-English, evidence-first report for every outcome.
 
     AI text is marked as a model assessment. For offline/invalid responses the
     report relies only on verified monitoring observations.
@@ -150,7 +216,7 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
     alert = context.get("alert") or {}
     errors = context.get("errors") or []
     source = str(alert.get("source") or "").lower()
-    resource = safe_text(alert.get("resource") or "منبع نامشخص", 100)
+    resource = safe_text(alert.get("resource") or "unknown resource", 100)
     alert_text = safe_text(alert.get("message"), 360)
     status = str(alert.get("status") or "").lower()
     confirmed = observed_incident(context)
@@ -173,17 +239,17 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
             })
 
     if confirmed:
-        title = f"گزارش خرابی {source.upper()}: {resource}"
+        title = f"{source.upper()} incident: {resource}"
         summary = (
-            f"سامانه پایش خرابی {resource} را ثبت کرده است."
-            + (f" هشدار: {alert_text}" if alert_text else "")
+            f"Monitoring confirmed a failure affecting {resource}."
+            + (f" Alert: {alert_text}" if alert_text else "")
         )
     elif alert_text:
-        title = f"گزارش بررسی: {resource}"
-        summary = f"درخواست یا هشدار دریافت شد: {alert_text}"
+        title = f"Infrastructure assessment: {resource}"
+        summary = f"A request or alert was received: {alert_text}"
     else:
-        title = "گزارش بررسی زیرساخت"
-        summary = "درخواست برای تحلیل وضعیت سیستم دریافت شد."
+        title = "Infrastructure assessment"
+        summary = "A request to investigate the infrastructure was received."
 
     pipeline_failure = None
     for group in ("ci_pipeline_logs", "incident_record_snapshot"):
@@ -194,72 +260,98 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
         if pipeline_failure is not None:
             break
 
-    root_cause = "علت اصلی هنوز با شواهد موجود تأیید نشده است."
+    root_cause = "The root cause is not yet confirmed by the available evidence."
     if source == "jenkins" and pipeline_failure:
         primary = pipeline_failure.get("primary_error")
+        steps, explanation = _jenkins_recommendations(pipeline_failure, steps)
         if isinstance(primary, str) and primary.strip():
             root_cause = (
-                "خطای مشخص ثبت‌شده در Console: " + safe_text(primary, 350)
-                + ". این پیام مبنای بررسی است؛ علت ریشه‌ای هنوز باید تأیید شود."
+                f"Jenkins reported: {safe_text(primary, 330)}. "
+                "This is an observed failure message, not a verified root cause."
             )
+            if explanation:
+                root_cause = explanation + " " + root_cause
             stage = pipeline_failure.get("failing_stage")
             command = pipeline_failure.get("failing_command")
             if stage:
                 evidence.append({
-                    "text": "مرحله نزدیک به خطا: " + safe_text(stage, 100),
+                    "text": "Failing stage: " + safe_text(stage, 100),
                     "source": "jenkins_console", "type": "observed",
                 })
             if command:
                 evidence.append({
-                    "text": "دستور نزدیک به خطا: " + safe_text(command, 230),
+                    "text": "Associated command: " + safe_text(command, 230),
                     "source": "jenkins_console", "type": "observed",
                 })
+            summary = f"The Jenkins build failed in {stage or 'an unidentified stage'}." + (
+                f" {explanation}" if explanation else " Revive identified the reported error."
+            )
         else:
             root_cause = (
-                "در داده‌های موجود فقط وضعیت شکست Build ثبت شده است. "
-                "پیام پایان Pipeline یا Exit Code به‌تنهایی علت خطا را نشان نمی‌دهد."
+                "Only general build-failure and npm help messages were available. "
+                "Revive could not establish the specific reason for the failure."
+            )
+            stage = pipeline_failure.get("failing_stage")
+            summary = (
+                f"Jenkins reported a failure for {resource}. "
+                "Revive could not identify a specific cause from the available console output."
             )
     if model_ok:
+        # A convincing LLM explanation is NOT evidence. If Jenkins returned
+        # only npm help text, do not allow the model to invent a specific cause.
+        no_specific_jenkins_error = bool(
+            source == "jenkins" and pipeline_failure
+            and not pipeline_failure.get("primary_error")
+        )
         model_summary = model_report.get("summary") or parsed.get("diagnostic_report")
-        if isinstance(model_summary, str) and model_summary.strip():
+        if (
+            not no_specific_jenkins_error and _english(model_summary)
+            and not _manual_log_handoff(model_summary)
+        ):
             summary = safe_text(model_summary, 1050)
         suggested_cause = model_report.get("likely_cause")
-        if isinstance(suggested_cause, str) and suggested_cause.strip() and suggested_cause.strip().lower() not in ("unknown", "n/a", "none", "نامشخص"):
-            root_cause = "ارزیابی پیشنهادی AI (هنوز نیازمند تأیید): " + safe_text(suggested_cause, 430)
+        if (
+            not no_specific_jenkins_error and _english(suggested_cause)
+            and suggested_cause.strip().lower() not in ("unknown", "n/a", "none")
+            and not _manual_log_handoff(suggested_cause)
+        ):
+            root_cause = "AI hypothesis (not yet verified): " + safe_text(suggested_cause, 430)
         proposed_steps = _list_of_text(model_report.get("recommended_steps"), limit=5)
         proposed_checks = _list_of_text(model_report.get("verification_steps"), limit=4)
-        if proposed_steps:
-            steps = proposed_steps
-        if proposed_checks:
-            verification = proposed_checks
+        usable_steps = [step for step in proposed_steps if _english(step) and not _manual_log_handoff(step)]
+        usable_checks = [check for check in proposed_checks if _english(check) and not _manual_log_handoff(check)]
+        if usable_steps and not no_specific_jenkins_error:
+            steps = usable_steps
+        if usable_checks and not no_specific_jenkins_error:
+            verification = usable_checks
         report_status = "ai_assessment"
-        ai_note = "تحلیل AI موجود است، اما علت ریشه‌ای و رفع مشکل بدون بررسی شواهد تأییدشده نیست."
+        ai_note = "AI assessment is available. The proposed cause and recovery remain unverified until monitored evidence confirms them."
     else:
         report_status = "ai_unavailable" if engine_status == "offline" else "ai_unusable"
         ai_note = (
-            "موتور هوش مصنوعی پاسخ نداد؛ گزارش فقط بر پایه شواهد Monitoring تهیه شده است."
+            "AI was unavailable. This report is based exclusively on monitoring evidence."
             if engine_status == "offline"
-            else "پاسخ مدل قابل اعتبارسنجی نبود؛ نتیجه تشخیص AI در این گزارش استفاده نشده است."
+            else "The AI response was unusable. Revive used only verified monitoring data."
         )
         steps = list(steps) + [
-            "اتصال، نام مدل و لاگ‌های سرویس Ollama را بررسی کنید."
+            "Restore AI service availability to enable an additional automated assessment."
         ]
     if not evidence:
-        ai_note += " شواهد خطای مستقلی علاوه بر Alert در دسترس نیست."
+        ai_note += " No independent error evidence beyond the alert was available."
 
     agent = agent or {}
     executed = bool(agent.get("agent_triggered"))
     verified = executed and bool(agent.get("resolved"))
     if verified:
-        action = "ابزار اجرا شد و بازیابی منبع به‌طور مستقل تأیید شده است."
+        action = "A remediation tool ran, and resource recovery was independently verified."
     elif executed:
-        action = "ابزار اجرا شده است؛ رفع کامل مشکل تأیید نشده است."
+        action = "A remediation tool ran, but recovery was not verified."
     else:
-        action = "هیچ ابزار اصلاحی اجرا نشده است."
+        action = "No remediation tool was executed."
 
     matched = (retrieval or {}).get("results") or []
     return {
-        "language": "fa",
+        "language": "en",
         "status": report_status,
         "title": title,
         "incident_confirmed": confirmed,
@@ -276,6 +368,7 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
             "primary_error": safe_text(pipeline_failure.get("primary_error"), 350) or None,
             "failing_stage": safe_text(pipeline_failure.get("failing_stage"), 110) or None,
             "failing_command": safe_text(pipeline_failure.get("failing_command"), 220) or None,
+            "evidence_origin": pipeline_failure.get("evidence_origin") or "stored_jenkins_console",
         } if pipeline_failure else None,
         "action": action,
         "recovery_verified": verified,
