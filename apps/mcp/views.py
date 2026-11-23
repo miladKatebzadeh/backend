@@ -339,6 +339,8 @@ def mcp_ai_chat(request):
     return response.Response({
         'reply': result['reply'],
         'engine_status': result['engine_status'],
+        'user_report': result.get('user_report'),
+        'ollama_error': result.get('ollama_error'),
         'router': decisions.get('router', 'keywords'),
         'laya_model': decisions.get('laya_model', ''),
         'action': _action_payload(result),

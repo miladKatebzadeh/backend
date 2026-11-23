@@ -15,6 +15,12 @@ from django.utils.text import slugify
 from apps.collector.models import DockerMetric, JenkinsBuild, PrometheusAlert
 from apps.knowledge.retrieval import retrieve_runbooks
 from apps.mcp.incident_context import build_incident_context, retrieval_query_text, routing_context_text
+from apps.mcp.diagnostic_reporting import (
+    observed_incident,
+    offline_diagnosis,
+    ollama_error_details,
+    readable_report,
+)
 from apps.mcp.models import MCPTool, get_setting
 from apps.mcp.runtime import MCPSandboxExecutor
 from apps.mcp.trace_presentation import (
@@ -926,6 +932,7 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
     reply_text = ''
     agent = {'agent_triggered': False, 'sandbox_output': None}
     monitoring_override = False
+    ollama_error = None
     try:
         with _child_span(langfuse, STAGES['context'], {
             'source': (incident_context.get('alert') or {}).get('source'),
@@ -1023,7 +1030,15 @@ RUNBOOK entries are ranked candidates, not proof by themselves. Use a runbook on
 Choose at most one tool. tool_name must be an exact name from TOOLS, or an empty string if none should run.
 tool_target is the resource that tool should act on, copied from the error, or an empty string.
 Do not invent a tool name. Do not claim a tool has already run.
-Return only JSON with keys incident_detected (boolean), error_scope (string), diagnostic_report (string), evidence_refs (array of short strings copied from the error or runbook labels), engine_status (string, use "ok"), tool_name (string), tool_target (string).
+Return only JSON with keys incident_detected (boolean), error_scope (string), diagnostic_report (string), evidence_refs (array of short strings copied from the error or runbook labels), engine_status (string, use "ok"), tool_name (string), tool_target (string), user_report (object).
+Write the diagnostic_report in clear, non-technical Persian suitable for the user.
+Also return user_report with: summary (a brief Persian explanation), likely_cause
+(a hypothesis, or explicitly "unknown"), recommended_steps (array of 2-4 safe
+Persian steps), verification_steps (array of 1-3 checks).
+Never state a suspected root cause as confirmed unless independent telemetry
+supports it. Never claim a command ran merely because it is recommended.
+If runbooks are empty, base the answer on available Alert/Error evidence and
+explicitly say that no matching Runbook was found.
 """
         retry_prompt = system_prompt + '\nThe previous reply was rejected. Return only the JSON object.'
         try:
@@ -1040,19 +1055,20 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
                     reply_text, 'ok' if _parse_diagnosis(reply_text) else 'invalid'
                 ))
         except Exception as exc:
+            ollama_error = ollama_error_details(exc, target_model)
+            logger.warning(
+                'Ollama diagnosis request failed: category=%s http_status=%s model=%s type=%s',
+                ollama_error['category'], ollama_error['http_status'],
+                ollama_error['model'], ollama_error['error_type'],
+            )
             _set_output(llm_span, {
                 'status': 'offline',
-                'summary': 'The model request failed.',
-                'error_type': exc.__class__.__name__,
+                'summary': 'Model request failed; monitored Incident evidence remains valid.',
+                'ollama_error': ollama_error,
             })
             engine_status = 'offline'
-            reply_text = json.dumps({
-                'incident_detected': False,
-                'error_scope': 'engine',
-                'engine_status': 'offline',
-                'diagnostic_report': f'Ollama at {ollama_host} did not return a diagnosis ({exc.__class__.__name__}).',
-                'evidence_refs': [],
-            })
+            monitoring_override = observed_incident(incident_context)
+            reply_text = offline_diagnosis(incident_context, ollama_error)
         if engine_status == 'ok':
             parsed = _parse_diagnosis(reply_text)
             if parsed is None:
@@ -1066,16 +1082,39 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
                         ))
                     parsed = _parse_diagnosis(reply_text)
                 except Exception as exc:
+                    ollama_error = ollama_error_details(exc, target_model)
+                    engine_status = 'offline'
                     _set_output(retry_span, {
-                        'status': 'error',
-                        'summary': 'The retry did not produce a valid model response.',
-                        'error_type': exc.__class__.__name__,
+                        'status': 'offline',
+                        'summary': 'The retry failed while requesting the model.',
+                        'ollama_error': ollama_error,
                     })
-                    logger.exception('diagnosis retry failed')
+                    logger.warning(
+                        'Ollama diagnosis retry failed: category=%s http_status=%s type=%s',
+                        ollama_error['category'], ollama_error['http_status'], ollama_error['error_type'],
+                    )
                     parsed = None
             if parsed is None:
-                engine_status = 'invalid'
-                reply_text = _invalid_diagnosis()
+                if engine_status == 'offline':
+                    monitoring_override = observed_incident(incident_context)
+                    reply_text = offline_diagnosis(incident_context, ollama_error)
+                else:
+                    engine_status = 'invalid'
+                    if observed_incident(incident_context):
+                        monitoring_override = True
+                        reply_text = json.dumps({
+                            'incident_detected': True,
+                            'error_scope': (incident_context.get('alert') or {}).get('family') or 'engine',
+                            'engine_status': 'invalid',
+                            'diagnostic_report': (
+                                'سامانه پایش وجود خرابی را تأیید کرده، اما خروجی مدل قابل اعتبارسنجی نیست. '
+                                'علت اصلی هنوز مشخص نشده است. ابتدا شواهد و لاگ‌های مرتبط را بررسی کنید.'
+                            ),
+                            'evidence_refs': ['monitored incident alert'],
+                            'tool_name': '', 'tool_target': '',
+                        }, ensure_ascii=False)
+                    else:
+                        reply_text = _invalid_diagnosis()
             else:
                 # The Incident ledger / source alert is independent monitoring
                 # evidence. A false model classification cannot erase it.
@@ -1117,9 +1156,15 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
             route_view, retrieval, reply_text, engine_status, agent,
             allow_remediation, query=query, monitoring_override=monitoring_override,
         ))
+    user_report = readable_report(
+        incident_context, reply_text, engine_status, agent=agent,
+        retrieval=retrieval, error=ollama_error,
+    )
     return {
         'reply': reply_text,
         'engine_status': engine_status,
+        'user_report': user_report,
+        'ollama_error': ollama_error,
         'agent_automation': agent,
         'decisions': decisions,
         'trace_id': handle['span'].id if handle else None,
