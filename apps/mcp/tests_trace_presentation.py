@@ -172,6 +172,18 @@ class TracePresentationTests(SimpleTestCase):
         self.assertEqual(trace.children[0].output["incident_family"], "container_runtime")
         self.assertNotEqual(trace.children[0].input, trace.children[0].output)
 
+    def test_exceptions_are_not_published_as_successful_spans(self):
+        client = _LangfuseTarget("public", "secret", "http://langfuse.internal")
+        trace = _Trace("Revive | Incident diagnosis", {"source": "docker"})
+        with self.assertRaises(ValueError):
+            with _child_span(client, STAGES["retrieval"], {"query": "grafana exited"}, parent=trace):
+                raise ValueError("search crashed")
+        self.assertEqual(trace.children[0].output["status"], "error")
+        self.assertEqual(trace.children[0].output["error_type"], "ValueError")
+        self.assertNotIn("search crashed", json.dumps(trace.children[0].output))
+        self.assertEqual(diagnosis_view("{}", "error")["status"], "error")
+        self.assertIn("failed", diagnosis_view("{}", "error")["summary"])
+
     def test_ingestion_emits_readable_stages_metadata_and_same_trace_id(self):
         client = _LangfuseTarget("pk", "sk", "http://langfuse.internal")
         handle = _open_trace(
