@@ -150,6 +150,33 @@ class JenkinsEvidenceFlowTests(TestCase):
         self.assertIn("gunicorn", trace["pipeline_failure"]["primary_error"])
         self.assertEqual(trace["pipeline_failure"]["failing_stage"], "Deploy Container")
 
+    def test_build_number_scope_excludes_another_failure_in_same_job(self):
+        JenkinsBuild.objects.create(
+            job_name="CSAI", build_number=6, result="FAILURE",
+            raw_build_info={"failure_analysis": analyze_jenkins_console(SAMPLE_JENKINS_CONSOLE)},
+            updated_at=self.now,
+        )
+        JenkinsBuild.objects.create(
+            job_name="CSAI", build_number=7, result="FAILURE",
+            raw_build_info={"failure_analysis": analyze_jenkins_console(
+                "error: unrelated compile failure"
+            )},
+            updated_at=self.now,
+        )
+        context = build_incident_context(
+            "CSAI Build #6 failed",
+            {
+                "source": "jenkins", "resource": "CSAI", "status": "open",
+                "snapshot": {"build_number": 6, "build_result": "FAILURE"},
+            },
+            observed_at=self.now,
+        )
+        rows = context["evidence"]["ci_pipeline_logs"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["build_number"], 6)
+        self.assertIn("gunicorn", rows[0]["failure_analysis"]["primary_error"])
+        self.assertNotIn("unrelated compile", json.dumps(context))
+
     def test_generic_wrapper_only_keeps_cause_unknown(self):
         JenkinsBuild.objects.create(
             job_name="CSAI", build_number=6, result="FAILURE",
