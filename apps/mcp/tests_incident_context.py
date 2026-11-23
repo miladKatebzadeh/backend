@@ -183,6 +183,7 @@ class EvidenceContextTests(TestCase):
     @patch("apps.mcp.diagnostics.get_setting")
     @patch("apps.mcp.diagnostics.diagnose")
     def test_monitor_daemon_supplies_scoped_evidence_and_does_not_fake_remediation(self, diagnose, settings):
+        DockerMetric.objects.filter(container_name="unrelated-container").update(status="running")
         settings.side_effect = lambda key, default=None: "15" if key == "scrape_interval" else "0"
         diagnose.return_value = {
             "engine_status": "ok", "agent_automation": {"agent_triggered": False}, "reply": "{}",
