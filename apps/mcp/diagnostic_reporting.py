@@ -191,7 +191,7 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
         if isinstance(model_summary, str) and model_summary.strip():
             summary = safe_text(model_summary, 1050)
         suggested_cause = model_report.get("likely_cause")
-        if isinstance(suggested_cause, str) and suggested_cause.strip():
+        if isinstance(suggested_cause, str) and suggested_cause.strip() and suggested_cause.strip().lower() not in ("unknown", "n/a", "none", "نامشخص"):
             root_cause = "ارزیابی پیشنهادی AI (هنوز نیازمند تأیید): " + safe_text(suggested_cause, 430)
         proposed_steps = _list_of_text(model_report.get("recommended_steps"), limit=5)
         proposed_checks = _list_of_text(model_report.get("verification_steps"), limit=4)
