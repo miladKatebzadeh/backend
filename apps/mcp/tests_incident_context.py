@@ -86,6 +86,26 @@ class EvidenceContextTests(TestCase):
         self.assertEqual(ctx["errors"], [])
         self.assertEqual(ctx["evidence_status"], "alert_only")
 
+    def test_historical_incident_uses_persisted_snapshot_not_current_telemetry(self):
+        old = self.now - timedelta(days=2)
+        context = build_incident_context(
+            "Container grafana exited",
+            resource_scope={
+                "source": "docker", "resource": "grafana", "status": "open",
+                "snapshot": {
+                    "container_status": "exited",
+                    "oom_killed": True,
+                    "exit_code": 137,
+                    "log_excerpt": "ERROR: OOM encountered token=historical",
+                },
+            },
+            observed_at=old,
+        )
+        self.assertEqual(context["evidence_status"], "incident_snapshot")
+        self.assertIn("incident_record_snapshot", context["evidence"])
+        self.assertIn("oom_killed", {x["kind"] for x in context["errors"]})
+        self.assertNotIn("historical", json.dumps(context))
+
     def test_jenkins_and_prometheus_use_their_own_sources(self):
         JenkinsBuild.objects.create(
             job_name="release-pipeline",
