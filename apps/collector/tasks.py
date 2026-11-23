@@ -278,6 +278,18 @@ class StandaloneCollectorDaemon:
             if current is None:
                 JenkinsBuild.objects.create(job_name=job_name, build_number=build_number, **payload)
                 continue
+            if (
+                result in ('FAILURE', 'UNSTABLE', 'ABORTED')
+                and current.result == result
+                and not console_output
+                and current.console_output
+            ):
+                # A transient Jenkins console fetch failure must not erase the
+                # previously captured evidence for this exact Build.
+                payload['console_output'] = current.console_output
+                existing = current.raw_build_info if isinstance(current.raw_build_info, dict) else {}
+                if isinstance(existing.get('failure_analysis'), dict):
+                    payload['raw_build_info']['failure_analysis'] = existing['failure_analysis']
             if current.result != result:
                 current.remediation_attempted = False
                 current.last_attempt_at = None
