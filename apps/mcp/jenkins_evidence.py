@@ -1,14 +1,14 @@
-"""Extract actionable Jenkins failure evidence from the full console output.
+"""Find meaningful CI failures instead of Jenkins and npm help/footer messages.
 
-Jenkins pipeline wrappers (e.g. "script returned exit code 1", "Finished:
-FAILURE", "[Pipeline] // timeout") indicate a failed run but do not identify a
-root cause. The analyzer keeps a bounded surrounding window and provenance
-for genuine error messages. No command is executed or inferred as successful.
+The selected lines are observations, not a verified root cause. Keep evidence
+bounded, scrub common credentials and do not infer commands or stage ownership.
 """
 import re
+from urllib.parse import quote
+
+import requests
 
 from apps.mcp.trace_presentation import safe_text
-
 
 _MAX_SOURCE_CHARS = 500_000
 _MAX_ERROR_LINES = 4
@@ -22,6 +22,29 @@ _WRAPPER = re.compile(
     r"|hudson\.AbortException:\s*script returned exit code\s+\d+)",
     re.IGNORECASE,
 )
+_NPM_FOOTER = re.compile(
+    r"^npm\s+(?:ERR!|error)\s*(?:"
+    r"A complete log of this run|A complete log of this run can be found"
+    r"|Run [\"']?npm help|aliases:|Usage:|Options:|For more info"
+    r"|npm ci\s*$|$|\s*$|\S+\s*\([^)]*\)\s*$)",
+    re.IGNORECASE,
+)
+_NPM_HELP = re.compile(
+    r"^npm\s+(?:ERR!|error)\s*(?:"
+    r"Clean install a project|Install a project with a clean slate"
+    r"|Run [\"']?npm help|aliases:|Usage:|Options:"
+    r"|A complete log|npm ci\s*$|$)",
+    re.IGNORECASE,
+)
+_NPM_CODE = re.compile(r"^npm\s+(?:ERR!|error)\s+code\s+([A-Z][A-Z0-9_]+)\b", re.IGNORECASE)
+_NPM_CAUSE = re.compile(
+    r"(?:\b(?:EUSAGE|ERESOLVE|ENOENT|EACCES|EINTEGRITY|ETARGET|ENOTFOUND)\b"
+    r"|\b(?:Missing|Invalid):\s|package-lock\.json|npm-shrinkwrap\.json"
+    r"|(?:package\.json\s+and\s+package-lock\.json)"
+    r"|\bcannot\s+(?:install|resolve|find|read)|\bunable to resolve"
+    r"|\bdependency tree\b|\bconflicting peer dependency\b)",
+    re.IGNORECASE,
+)
 _STRONG = re.compile(
     r"(?:ModuleNotFoundError|ImportError|FileNotFoundError|PermissionError"
     r"|NameError|SyntaxError|TypeError|AssertionError|Traceback \(most recent call last\)"
@@ -31,7 +54,7 @@ _STRONG = re.compile(
     r"|out of memory|OOMKilled|cannot find module|Could not resolve"
     r"|failed to (?:build|create|connect|start|pull|load|install|compile|resolve)"
     r"|connection refused|cannot connect|Error response from daemon"
-    r"|npm ERR!|npm error|error TS\d+|\b(?:pytest|test)\s+failed\b"
+    r"|error TS\d+|\b(?:pytest|test)\s+failed\b"
     r"|(?:fatal|error):\s*\S)",
     re.IGNORECASE,
 )
@@ -41,25 +64,51 @@ _ERROR = re.compile(
     re.IGNORECASE,
 )
 _IGNORE = re.compile(
-    r"^(?:\s*(?:\[Pipeline\]|Finished:|Pipeline failed!?|"
-    r"ERROR:\s*script returned exit code|\+\s*echo\b))",
+    r"^\s*(?:\[Pipeline\]|Finished:|Pipeline failed!?|"
+    r"ERROR:\s*script returned exit code|\+\s*echo\b)",
     re.IGNORECASE,
 )
 
 
+def _sanitized(line, limit=260):
+    return safe_text(line, limit)
+
+
 def _score(line):
-    """Only substantive error messages count as possible causal evidence."""
-    if not line or _WRAPPER.search(line) or _IGNORE.search(line):
+    """Actionable descriptions outrank error codes; npm help text scores zero."""
+    stripped = line.strip()
+    if not stripped or _WRAPPER.search(stripped) or _IGNORE.search(stripped):
         return 0
-    if _STRONG.search(line):
+    if _NPM_FOOTER.search(stripped) or _NPM_HELP.search(stripped):
+        return 0
+    if stripped.lower().startswith(("npm error", "npm err!")):
+        if _NPM_CODE.search(stripped):
+            return 2
+        if _NPM_CAUSE.search(stripped):
+            return 6
+        if _STRONG.search(stripped) and len(stripped) > 23:
+            return 5
+        if len(stripped) >= 36 and _ERROR.search(stripped):
+            return 3
+        return 0
+    if _STRONG.search(stripped):
+        return 5
+    if _ERROR.search(stripped) and not stripped.lstrip().startswith(("+ ", "> ")):
         return 3
-    if _ERROR.search(line) and not line.lstrip().startswith(("+ ", "> ")):
-        return 2
     return 0
 
 
-def _sanitized(line, limit=260):
-    return safe_text(line, limit)
+def _command_matches_error(command, error):
+    """A nearby git rev-parse is NOT an npm install command."""
+    if not command:
+        return False
+    c = command.lower()
+    e = error.lower()
+    if e.startswith(("npm error", "npm err!")):
+        return bool(re.search(r"\b(npm|npx|pnpm|yarn)\b", c))
+    if "error ts" in e or "cannot find module" in e:
+        return bool(re.search(r"\b(npm|npx|pnpm|yarn|node|tsc)\b", c))
+    return True
 
 
 def _analyze_lines(lines):
@@ -70,9 +119,16 @@ def _analyze_lines(lines):
     exit_code = None
     for index, raw in enumerate(lines):
         stripped = raw.strip()
+        if stripped.startswith("[Pipeline] // stage"):
+            stage = None
+            command = None
+            command_line = -1000
+            continue
         match = _STAGE.match(stripped)
         if match:
             stage = _sanitized(match.group(1), 100)
+            command = None
+            command_line = -1000
         shell = _COMMAND.match(stripped)
         if shell:
             command = _sanitized(shell.group(1), 230)
@@ -82,39 +138,53 @@ def _analyze_lines(lines):
             exit_code = int(returned.group(1))
         score = _score(stripped)
         if score:
+            linked_command = (
+                command if (0 <= index - command_line <= 25
+                            and _command_matches_error(command, stripped))
+                else None
+            )
             records.append({
                 "index": index,
                 "score": score,
                 "message": _sanitized(stripped),
                 "stage": stage,
-                "command": command if index - command_line <= 75 else None,
+                "command": linked_command,
             })
 
-    # Prefer exact failures over status text; break ties by the latest event.
     ranked = sorted(records, key=lambda item: (item["score"], item["index"]), reverse=True)
     selected = []
     seen = set()
     for item in ranked:
         if item["message"] in seen:
             continue
-        seen.add(item["message"])
         selected.append(item)
+        seen.add(item["message"])
         if len(selected) >= _MAX_ERROR_LINES:
             break
 
     primary = selected[0] if selected else None
     window = []
     if primary:
-        start = max(0, primary["index"] - 3)
-        end = min(len(lines), primary["index"] + 4)
+        start = max(0, primary["index"] - 4)
+        end = min(len(lines), primary["index"] + 6)
         window = [_sanitized(line) for line in lines[start:end] if line.strip()]
+    npm_failure = any(
+        line.strip().lower().startswith(("npm error", "npm err!"))
+        for line in lines
+    )
+    if primary:
+        diagnostic_status = "specific_error_found"
+    elif npm_failure:
+        diagnostic_status = "insufficient_console_detail"
+    else:
+        diagnostic_status = "only_generic_build_failure"
     return {
-        "diagnostic_status": "specific_error_found" if primary else "only_generic_build_failure",
+        "diagnostic_status": diagnostic_status,
         "primary_error": primary["message"] if primary else None,
         "failing_stage": primary["stage"] if primary else None,
         "failing_command": primary["command"] if primary else None,
         "error_lines": [item["message"] for item in selected],
-        "error_context": window[:8],
+        "error_context": window[:9],
         "execution_exit_code": exit_code,
         "original_line_count": len(lines),
         "source": "jenkins_console",
@@ -123,45 +193,81 @@ def _analyze_lines(lines):
 
 
 def analyze_jenkins_console(text):
-    """Summarize a bounded source window without treating wrappers as causes."""
     source = str(text or "")
-    if len(source) > _MAX_SOURCE_CHARS:
-        source = source[-_MAX_SOURCE_CHARS:]
-        truncated = True
-    else:
-        truncated = False
-    result = _analyze_lines(source.splitlines())
+    truncated = len(source) > _MAX_SOURCE_CHARS
+    result = _analyze_lines(source[-_MAX_SOURCE_CHARS:].splitlines())
     result["source_truncated"] = truncated
     return result
 
 
 def select_jenkins_console(text, limit_chars=14000):
-    """Save high-signal failure windows, not just the last 100 Jenkins lines.
-
-    Include stage/command provenance and a short tail. The stored selection is
-    bounded and sanitized; the full raw console is never persisted here.
-    """
+    """Retain critical windows from the fetched console, not just footer lines."""
     source = str(text or "")[-_MAX_SOURCE_CHARS:]
     lines = source.splitlines()
     analysis = _analyze_lines(lines)
-    indices = set(range(max(0, len(lines) - 22), len(lines)))
+    indices = set(range(max(0, len(lines) - 18), len(lines)))
     for message in analysis["error_lines"][:3]:
-        # Match using the exact sanitized form that was scored above.
         matches = [i for i, line in enumerate(lines) if _sanitized(line.strip()) == message]
         if not matches:
             continue
         center = matches[-1]
-        indices.update(range(max(0, center - 4), min(len(lines), center + 4)))
-        for j in range(center, max(-1, center - 85), -1):
+        indices.update(range(max(0, center - 6), min(len(lines), center + 6)))
+        for j in range(center, max(-1, center - 70), -1):
             if _STAGE.match(lines[j].strip()):
                 indices.add(j)
                 break
-        for j in range(center, max(-1, center - 75), -1):
-            if _COMMAND.match(lines[j].strip()):
+        for j in range(center, max(-1, center - 30), -1):
+            shell = _COMMAND.match(lines[j].strip())
+            if shell and _command_matches_error(shell.group(1), message):
                 indices.add(j)
                 break
     selected = [_sanitized(lines[i], 330) for i in sorted(indices) if lines[i].strip()]
-    # Favor the error windows: cut nonessential trailing output before actual
-    # error evidence if the selected result exceeds the storage budget.
     joined = "\n".join(selected)
+    if len(joined) > limit_chars:
+        # Keep actual failure evidence before generic end-of-build output.
+        evidence_lines = []
+        for message in analysis["error_lines"][:3]:
+            evidence_lines.extend([message, *analysis["error_context"]])
+        prefix = "\n".join(dict.fromkeys(evidence_lines))
+        if len(prefix) < limit_chars:
+            joined = prefix + "\n" + joined[-(limit_chars - len(prefix) - 1):]
     return joined[:limit_chars]
+
+
+def fetch_jenkins_build_console(job_name, build_number):
+    """Bounded read-only fetch of the *exact* Jenkins Build console.
+
+    Used only by Incident-linked diagnoses when existing evidence contains no
+    substantive error. Credentials and URL are never included in trace output.
+    """
+    from apps.mcp.models import get_setting
+    import os
+
+    job_name = str(job_name or "").strip()
+    if not job_name or len(job_name) > 255:
+        return None
+    try:
+        number = int(build_number)
+    except (TypeError, ValueError):
+        return None
+    if number < 1:
+        return None
+
+    base = get_setting("jenkins_url", os.getenv("JENKINS_URL", "")).rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        return None
+    username = get_setting("jenkins_user", os.getenv("JENKINS_USER", ""))
+    token = get_setting("jenkins_token", os.getenv("JENKINS_TOKEN", ""))
+    auth = (username, token) if username and token else None
+    try:
+        # Jenkins fullName may contain nested folder jobs.
+        parts = [quote(item, safe="") for item in job_name.split("/") if item]
+        path = "/job/".join(parts)
+        url = f"{base}/job/{path}/{number}/consoleText"
+        response = requests.get(url, auth=auth, timeout=(3, 8))
+        response.raise_for_status()
+        if not response.text:
+            return None
+        return response.text[-_MAX_SOURCE_CHARS:]
+    except requests.RequestException:
+        return None
