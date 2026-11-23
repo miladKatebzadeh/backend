@@ -316,7 +316,13 @@ def mcp_ai_chat(request):
     # Opening an Incident chat is diagnosis, not approval to execute a tool.
     # Incident-linked calls need an explicit remediation flag, even if auto mode is on.
     allow_remediation = requested if incident is not None else (auto or requested)
-    resource_scope = {'source': incident.source, 'resource': incident.resource} if incident is not None else None
+    resource_scope = ({
+        'source': incident.source,
+        'resource': incident.resource,
+        'status': incident.status,
+        'severity': incident.severity,
+        'incident_id': incident.pk,
+    } if incident is not None else None)
     routing_message = (
         f"{incident.source} {incident.title}. {incident.description[:350]}"
         if incident is not None else None
@@ -326,6 +332,7 @@ def mcp_ai_chat(request):
         allow_remediation=allow_remediation,
         resource_scope=resource_scope,
         routing_message=routing_message,
+        observed_at=incident.last_seen if incident is not None else None,
     )
     decisions = result.get('decisions') or {}
     return response.Response({
