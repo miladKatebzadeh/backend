@@ -1267,6 +1267,7 @@ def monitor_incident_daemon():
             'source': 'jenkins',
             'resource': jenkins_row.job_name,
             'status': jenkins_row.result,
+            'build_number': jenkins_row.build_number,
         }
         observed_at = jenkins_row.updated_at
     result = diagnose(
