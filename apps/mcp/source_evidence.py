@@ -28,7 +28,7 @@ _DOCKER_FAILURES = (
     ("database_connection", r"\b(?:database.*connection refused|could not connect to server|connection to .*5432.*failed)\b"),
     ("network_connection", r"\b(?:connection refused|connection timed out|name or service not known|temporary failure in name resolution|ENOTFOUND|EAI_AGAIN)\b"),
     ("configuration_error", r"\b(?:configuration error|invalid configuration|missing required environment variable|KeyError:)\b"),
-    ("startup_failure", r"\b(?:failed to start|failed to initialize|fatal error|panic:|Traceback \(most recent call last\))\b"),
+    ("startup_failure", r"(?:\b(?:failed to start|failed to initialize|fatal error|panic:)\b|Traceback \(most recent call last\)|^\s*[A-Za-z_]+(?:Error|Exception):)"),
 )
 _DOCKER_COMPILED = [(name, re.compile(pattern, re.IGNORECASE)) for name, pattern in _DOCKER_FAILURES]
 _GENERIC_LOG = re.compile(r"^(?:\s*\[Pipeline\]|\s*Finished:|\s*\[INFO\]|\s*INFO\b)", re.IGNORECASE)
@@ -83,7 +83,9 @@ def analyze_docker_observation(observation):
         diagnostic_status = "insufficient_evidence"
         primary_message = None
         issue = (
-            "Docker reported a stopped or unhealthy container, but no specific error was captured."
+            "Docker health check reports unhealthy, but no specific cause was captured."
+            if str(row.get("health_status") or "").lower() == "unhealthy"
+            else "Docker reported a stopped or restarting container, but no specific error was captured."
             if str(row.get("status") or "").lower() in ("exited", "dead", "restarting", "unhealthy")
             else "No specific container failure could be established from the available sample."
         )
