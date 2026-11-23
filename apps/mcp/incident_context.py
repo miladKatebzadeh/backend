@@ -166,6 +166,8 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 add_error("exit_code", f"Container exit code {exit_code}; exit status is not a root cause", "docker_inspect", row.timestamp)
             if state_error and not row.oom_killed:
                 add_error("state_error", state_error, "docker_inspect", row.timestamp)
+            for line in entry["log_errors"][:2]:
+                add_error("log_error", line, "docker_logs", row.timestamp)
         if not rows and can_check_live:
             live = fetch_docker_evidence(resource)
             if isinstance(live, dict) and live.get("status") not in ("not_found", None):
@@ -402,7 +404,7 @@ def retrieval_query_text(decisions, incident_context, fallback_message):
             ])
             break
     for error in incident_context["errors"][:3]:
-        if error["kind"] in ("pipeline_error", "log_error", "oom_killed", "state_error", "metric_alert"):
+        if error["kind"] in ("pipeline_error", "log_error", "oom_killed", "state_error", "exit_code", "container_failure", "metric_alert"):
             parts.append(error["message"])
         if error["kind"] == "oom_killed":
             parts.append("out of memory container OOM")
