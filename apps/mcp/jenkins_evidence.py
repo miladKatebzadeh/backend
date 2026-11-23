@@ -12,6 +12,7 @@ from apps.mcp.trace_presentation import safe_text
 
 _MAX_SOURCE_CHARS = 500_000
 _MAX_ERROR_LINES = 4
+ANALYZER_VERSION = 2
 _STAGE = re.compile(r"^\[Pipeline\]\s*\{\s*\(([^)]+)\)\s*$")
 _COMMAND = re.compile(r"^\+\s+(.+)$")
 _EXIT = re.compile(r"script returned exit code\s+(\d+)", re.IGNORECASE)
@@ -114,6 +115,7 @@ def _command_matches_error(command, error):
 def _analyze_lines(lines):
     records = []
     stage = None
+    last_npm_stage = None
     commands = []
     exit_code = None
     for index, raw in enumerate(lines):
@@ -130,6 +132,8 @@ def _analyze_lines(lines):
         if shell:
             commands.append((index, _sanitized(shell.group(1), 230)))
             commands = commands[-12:]
+        if stripped.lower().startswith(("npm error", "npm err!")) and stage:
+            last_npm_stage = stage
         returned = _EXIT.search(stripped)
         if returned:
             exit_code = int(returned.group(1))
@@ -176,9 +180,10 @@ def _analyze_lines(lines):
     else:
         diagnostic_status = "only_generic_build_failure"
     return {
+        "analyzer_version": ANALYZER_VERSION,
         "diagnostic_status": diagnostic_status,
         "primary_error": primary["message"] if primary else None,
-        "failing_stage": primary["stage"] if primary else None,
+        "failing_stage": primary["stage"] if primary else last_npm_stage,
         "failing_command": primary["command"] if primary else None,
         "error_lines": [item["message"] for item in selected],
         "error_context": window[:9],
