@@ -914,10 +914,13 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
             'message': route_input, 'snapshot': context['fleet_anomaly_snapshot']
         }, parent=parent) as laya_span:
             decisions = route(route_input, context)
-            if incident_context and decisions.get('incident_family') == 'unknown':
+            if incident_context:
                 verified_family = incident_context['alert'].get('family')
                 if verified_family and verified_family != 'unknown':
-                    decisions = align_section({**decisions, 'incident_family': verified_family})
+                    # The monitored source determines the primary failure domain;
+                    # Laya still chooses auxiliary evidence flags.
+                    if decisions.get('incident_family') != verified_family:
+                        decisions = align_section({**decisions, 'incident_family': verified_family})
                     decisions['family_source'] = 'verified_alert_source'
             route_view = {
                 'router': decisions.get('router', 'keywords'),
