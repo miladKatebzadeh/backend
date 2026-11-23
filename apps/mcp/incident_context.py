@@ -142,7 +142,10 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 **entry, "logs": row.container_logs, "state_error": state_error,
             })
             analysis = baseline
-            if index == 0 and can_check_live and baseline["diagnostic_status"] == "insufficient_evidence":
+            if index == 0 and can_check_live and (
+                baseline["diagnostic_status"] == "insufficient_evidence"
+                or (baseline["category"] == "out_of_memory" and not row.oom_killed)
+            ):
                 live = fetch_docker_evidence(resource)
                 if isinstance(live, dict) and live.get("status") != "not_found":
                     inspected = analyze_docker_observation(live)
