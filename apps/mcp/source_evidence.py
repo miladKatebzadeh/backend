@@ -235,7 +235,7 @@ def fetch_prometheus_window(metric_name, labels, observed_at):
     metric_name = str(metric_name or "").strip()
     if not _METRIC_NAME.fullmatch(metric_name) or len(metric_name) > 200:
         return None
-    base = (get_setting("prometheus_url", os.getenv("PROMETHEUS_URL", "")) or "").rstrip("/")
+    base = (get_setting("prometheus_url", os.getenv("PROMETHEUS_URL", "http://127.0.0.1:9090")) or "").rstrip("/")
     if not base.startswith(("http://", "https://")):
         return None
     anchor = observed_at or timezone.now()
@@ -301,7 +301,7 @@ def fetch_active_alert(alert_name, source="prometheus", labels=None):
         base = (get_setting("alertmanager_url", os.getenv("ALERTMANAGER_URL", "")) or "").rstrip("/")
         path, params = "/api/v2/alerts", {"active": "true"}
     else:
-        base = (get_setting("prometheus_url", os.getenv("PROMETHEUS_URL", "")) or "").rstrip("/")
+        base = (get_setting("prometheus_url", os.getenv("PROMETHEUS_URL", "http://127.0.0.1:9090")) or "").rstrip("/")
         path, params = "/api/v1/alerts", None
     if not base.startswith(("http://", "https://")):
         return None
