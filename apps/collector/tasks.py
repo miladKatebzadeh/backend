@@ -7,6 +7,7 @@ import requests
 from django.utils import timezone
 
 from apps.mcp.models import get_setting, set_setting
+from apps.mcp.jenkins_evidence import analyze_jenkins_console, select_jenkins_console
 
 logger = logging.getLogger(__name__)
 
@@ -246,19 +247,30 @@ class StandaloneCollectorDaemon:
             duration = last_build.get('duration') or 0
             estimated = last_build.get('estimatedDuration') or 0
             console_output = ''
+            build_info = dict(last_build)
             if result in ('FAILURE', 'UNSTABLE', 'ABORTED'):
                 try:
                     log_url = f'{jenkins_url}/job/{quote(job_name)}/{build_number}/consoleText'
                     log_response = requests.get(log_url, auth=auth, timeout=5)
                     if log_response.status_code == 200:
-                        console_output = '\n'.join(log_response.text.splitlines()[-100:])
+                        full_console = log_response.text
+                        build_info['failure_analysis'] = analyze_jenkins_console(full_console)
+                        console_output = select_jenkins_console(full_console)
+                    else:
+                        logger.warning(
+                            'Jenkins console unavailable for %s build %s (HTTP %s)',
+                            job_name, build_number, log_response.status_code,
+                        )
                 except Exception as exc:
-                    console_output = f'Console read failed ({exc.__class__.__name__})'
+                    logger.warning(
+                        'Jenkins console read failed for %s build %s (%s)',
+                        job_name, build_number, exc.__class__.__name__,
+                    )
             payload = {
                 'result': result,
                 'duration_ms': duration,
                 'estimated_duration_ms': estimated,
-                'raw_build_info': last_build,
+                'raw_build_info': build_info,
                 'console_output': console_output,
                 'updated_at': timezone.now(),
             }
