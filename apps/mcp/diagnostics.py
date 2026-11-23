@@ -599,8 +599,24 @@ def _recent(queryset, time_field, limit=5):
     return list(queryset.order_by('-id')[:limit])
 
 
-def gather(decisions: dict) -> dict:
+def gather(decisions: dict, resource_scope=None) -> dict:
+    """Only use the linked resource's telemetry when an Incident is selected."""
     payload = {}
+    scoped_source = resource_scope.get('source') if isinstance(resource_scope, dict) else None
+    scoped_resource = resource_scope.get('resource') if isinstance(resource_scope, dict) else None
+    scoped = resource_scope is not None
+    docker_rows = DockerMetric.objects.all() if not scoped else (
+        DockerMetric.objects.filter(container_name=scoped_resource)
+        if scoped_source == 'docker' else DockerMetric.objects.none()
+    )
+    jenkins_rows = JenkinsBuild.objects.all() if not scoped else (
+        JenkinsBuild.objects.filter(job_name=scoped_resource)
+        if scoped_source == 'jenkins' else JenkinsBuild.objects.none()
+    )
+    alert_rows = PrometheusAlert.objects.all() if not scoped else (
+        PrometheusAlert.objects.filter(metric_name=scoped_resource)
+        if scoped_source in ('prometheus', 'alertmanager') else PrometheusAlert.objects.none()
+    )
     if decisions.get('need_container_events'):
         payload['container_telemetry'] = [
             {
@@ -612,12 +628,12 @@ def gather(decisions: dict) -> dict:
                 'timestamp': _stamp(row.timestamp),
                 'log_excerpt': _log_excerpt(row.container_logs),
             }
-            for row in _recent(DockerMetric.objects.all(), 'timestamp')
+            for row in _recent(docker_rows, 'timestamp')
         ]
     if decisions.get('need_metric_window'):
-        rows = _recent(PrometheusAlert.objects.exclude(alert_status='NORMAL'), 'updated_at')
+        rows = _recent(alert_rows.exclude(alert_status='NORMAL'), 'updated_at')
         if not rows:
-            rows = _recent(PrometheusAlert.objects.all(), 'updated_at', limit=2)
+            rows = _recent(alert_rows, 'updated_at', limit=2)
         payload['metric_window_anomalies'] = [
             {
                 'metric': row.metric_name,
@@ -638,7 +654,7 @@ def gather(decisions: dict) -> dict:
                 'updated_at': _stamp(row.updated_at),
                 'log_excerpt': _log_excerpt(row.console_output),
             }
-            for row in _recent(JenkinsBuild.objects.all(), 'updated_at', limit=3)
+            for row in _recent(jenkins_rows, 'updated_at', limit=3)
         ]
     if decisions.get('need_deployment_changes'):
         payload['deployment_changes'] = [
@@ -648,7 +664,7 @@ def gather(decisions: dict) -> dict:
                 'result': row.result,
                 'updated_at': _stamp(row.updated_at),
             }
-            for row in _recent(JenkinsBuild.objects.all(), 'updated_at')
+            for row in _recent(jenkins_rows, 'updated_at')
         ]
     return payload
 
@@ -755,7 +771,7 @@ def _active_tools():
     return MCPTool.objects.filter(status='active', archived_at__isnull=True).exclude(code='')
 
 
-def maybe_execute(reply_text: str, decisions: dict) -> dict:
+def maybe_execute(reply_text: str, decisions: dict, allowed_target=None) -> dict:
     meta = {
         'agent_triggered': False,
         'sandbox_output': None,
@@ -774,6 +790,9 @@ def maybe_execute(reply_text: str, decisions: dict) -> dict:
     scope = str(parsed.get('error_scope') or '').strip()
     target = str(parsed.get('tool_target') or '').strip() or scope
     meta['target'] = target
+    if allowed_target is not None and target != allowed_target:
+        meta['error'] = 'tool target does not match linked incident resource'
+        return meta
     tools = _active_tools()
     if 'tool_name' in parsed:
         chosen = str(parsed.get('tool_name') or '').strip()
@@ -828,20 +847,24 @@ def _confirm_recovery(agent, decisions):
     agent['resolved'] = state == 'running'
 
 
-def diagnose(user_message: str, allow_remediation: bool = False) -> dict:
+def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=None, routing_message=None) -> dict:
     user_message = (user_message or '').strip()
     if not user_message:
         return {'reply': '', 'engine_status': 'error', 'agent_automation': {'agent_triggered': False}, 'detail': 'empty'}
+    route_input = (routing_message or user_message).strip()
 
     ollama_host = get_setting('ollama_host', os.getenv('OLLAMA_HOST', 'http://localhost:11434'))
     target_model = get_setting('ollama_model', os.getenv('OLLAMA_MODEL', 'qwen2.5-coder:7b'))
     container_summary = 'All Running'
-    try:
-        crashed = list(DockerMetric.objects.exclude(status='running').order_by('-id')[:2])
-        if crashed:
-            container_summary = ', '.join(f'{row.container_name}:{row.status}' for row in crashed)
-    except Exception:
-        logger.exception('container summary failed')
+    if isinstance(resource_scope, dict):
+        container_summary = f"Linked resource: {resource_scope.get('source')}:{resource_scope.get('resource')}"
+    else:
+        try:
+            crashed = list(DockerMetric.objects.exclude(status='running').order_by('-id')[:2])
+            if crashed:
+                container_summary = ', '.join(f'{row.container_name}:{row.status}' for row in crashed)
+        except Exception:
+            logger.exception('container summary failed')
 
     context = {
         'error_raw_prompt': user_message,
@@ -861,8 +884,8 @@ def diagnose(user_message: str, allow_remediation: bool = False) -> dict:
     reply_text = ''
     agent = {'agent_triggered': False, 'sandbox_output': None}
     try:
-        with _child_span(langfuse, 'laya', {'message': user_message, 'snapshot': container_summary}, parent=parent) as laya_span:
-            decisions = route(user_message, context)
+        with _child_span(langfuse, 'laya', {'message': route_input, 'snapshot': container_summary}, parent=parent) as laya_span:
+            decisions = route(route_input, context)
             route_view = {
                 'router': decisions.get('router', 'keywords'),
                 'laya_model': decisions.get('laya_model', ''),
@@ -874,7 +897,7 @@ def diagnose(user_message: str, allow_remediation: bool = False) -> dict:
                 'need_runbook_search': bool(decisions.get('need_runbook_search')),
             }
             _set_output(laya_span, route_view)
-        query = runbook_query(decisions, user_message)
+        query = runbook_query(decisions, route_input)
         with _child_span(langfuse, 'runbook_retrieval', {
             'query': query,
             'section': decisions.get('incident_family', 'unknown'),
@@ -907,7 +930,7 @@ def diagnose(user_message: str, allow_remediation: bool = False) -> dict:
             })
         try:
             with _child_span(langfuse, 'telemetry', {'route': route_view}, parent=parent) as telemetry_span:
-                evidence = gather(decisions)
+                evidence = gather(decisions, resource_scope=resource_scope)
                 _set_output(telemetry_span, {
                     key: len(value) for key, value in evidence.items() if isinstance(value, list)
                 })
@@ -972,7 +995,8 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
             else:
                 reply_text = json.dumps(parsed)
         if allow_remediation and engine_status == 'ok':
-            agent = maybe_execute(reply_text, decisions)
+            allowed_target = resource_scope.get('resource') if isinstance(resource_scope, dict) else None
+            agent = maybe_execute(reply_text, decisions, allowed_target=allowed_target)
             _confirm_recovery(agent, decisions)
     finally:
         _close_trace(handle, {
