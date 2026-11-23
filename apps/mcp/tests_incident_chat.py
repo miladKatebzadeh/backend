@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 from django.test import TestCase
@@ -6,7 +7,7 @@ from rest_framework.test import APIClient
 
 from apps.collector.models import DockerMetric
 from apps.incidents.models import Incident
-from apps.mcp.diagnostics import gather
+from apps.mcp.diagnostics import gather, maybe_execute
 
 
 class IncidentChatTests(TestCase):
@@ -126,6 +127,21 @@ class IncidentChatTests(TestCase):
         self.assertEqual(len(evidence["container_telemetry"]), 1)
         self.assertEqual(evidence["container_telemetry"][0]["container"], "grafana")
         self.assertEqual(evidence["ci_pipeline_logs"], [])
+
+    def test_approved_remediation_cannot_target_another_container(self):
+        result = maybe_execute(
+            json.dumps({
+                "engine_status": "ok",
+                "incident_detected": True,
+                "error_scope": "container_runtime",
+                "tool_name": "restart_container",
+                "tool_target": "unrelated-container",
+            }),
+            {"incident_family": "container_runtime"},
+            allowed_target="grafana",
+        )
+        self.assertFalse(result["agent_triggered"])
+        self.assertIn("does not match", result["error"])
 
     @patch("apps.mcp.views.diagnose")
     def test_malformed_history_rejected(self, diagnose):
