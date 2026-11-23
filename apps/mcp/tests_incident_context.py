@@ -127,7 +127,7 @@ class EvidenceContextTests(TestCase):
             observed_at=self.now,
         )
         self.assertEqual(jenkins["evidence"]["ci_pipeline_logs"][0]["build_number"], 17)
-        self.assertTrue(any(x["kind"] == "log_error" for x in jenkins["errors"]))
+        self.assertTrue(any(x["kind"] == "pipeline_error" for x in jenkins["errors"]))
         prometheus = build_incident_context(
             "CPU alert",
             {"source": "prometheus", "resource": "node_cpu_usage"},
