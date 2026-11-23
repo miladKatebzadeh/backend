@@ -771,7 +771,7 @@ def _active_tools():
     return MCPTool.objects.filter(status='active', archived_at__isnull=True).exclude(code='')
 
 
-def maybe_execute(reply_text: str, decisions: dict) -> dict:
+def maybe_execute(reply_text: str, decisions: dict, allowed_target=None) -> dict:
     meta = {
         'agent_triggered': False,
         'sandbox_output': None,
@@ -790,6 +790,9 @@ def maybe_execute(reply_text: str, decisions: dict) -> dict:
     scope = str(parsed.get('error_scope') or '').strip()
     target = str(parsed.get('tool_target') or '').strip() or scope
     meta['target'] = target
+    if allowed_target is not None and target != allowed_target:
+        meta['error'] = 'tool target does not match linked incident resource'
+        return meta
     tools = _active_tools()
     if 'tool_name' in parsed:
         chosen = str(parsed.get('tool_name') or '').strip()
@@ -991,7 +994,8 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
             else:
                 reply_text = json.dumps(parsed)
         if allow_remediation and engine_status == 'ok':
-            agent = maybe_execute(reply_text, decisions)
+            allowed_target = resource_scope.get('resource') if isinstance(resource_scope, dict) else None
+            agent = maybe_execute(reply_text, decisions, allowed_target=allowed_target)
             _confirm_recovery(agent, decisions)
     finally:
         _close_trace(handle, {
