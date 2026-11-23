@@ -172,11 +172,58 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                     row.updated_at,
                 )
 
+    evidence_status = "observed" if any(evidence.values()) else "alert_only"
+
+    # Collector rows can be updated in place. For historic Incidents preserve
+    # the bounded snapshot saved by the server-side Incident ledger instead of
+    # substituting unrelated recent telemetry or silently losing the error.
+    snapshot = resource_scope.get("snapshot")
+    if resource and evidence_status == "alert_only" and isinstance(snapshot, dict):
+        recorded = {"resource": resource, "observed_at": _timestamp(observed_at)}
+        if source == "docker":
+            recorded.update({
+                "status": _redact(snapshot.get("container_status")),
+                "oom_killed": bool(snapshot.get("oom_killed")),
+                "restart_count": snapshot.get("restart_count"),
+                "exit_code": snapshot.get("exit_code"),
+                "state_error": _redact(snapshot.get("state_error")),
+                "log_errors": _error_lines(snapshot.get("log_excerpt")),
+            })
+            if recorded["oom_killed"]:
+                add_error("oom_killed", "Incident snapshot reports OOMKilled=true", "incident_ledger", observed_at)
+            if recorded["exit_code"] not in (None, "", 0, "0"):
+                add_error("exit_code", f"Container exit code {recorded['exit_code']}", "incident_ledger", observed_at)
+            if recorded["state_error"]:
+                add_error("state_error", recorded["state_error"], "incident_ledger", observed_at)
+            for line in recorded["log_errors"]:
+                add_error("log_error", line, "incident_ledger", observed_at)
+        elif source == "jenkins":
+            recorded.update({
+                "build_number": snapshot.get("build_number"),
+                "result": _redact(snapshot.get("build_result")),
+                "log_errors": _error_lines(snapshot.get("console_excerpt")),
+            })
+            if recorded["result"] in ("FAILURE", "UNSTABLE", "ABORTED"):
+                add_error("build_result", f"Build result {recorded['result']}", "incident_ledger", observed_at)
+            for line in recorded["log_errors"]:
+                add_error("log_error", line, "incident_ledger", observed_at)
+        elif source in ("prometheus", "alertmanager"):
+            recorded.update({
+                "value": snapshot.get("value"),
+                "status": _redact(snapshot.get("alert_status")),
+                "type": _redact(snapshot.get("metric_type")),
+            })
+            if recorded["status"] and recorded["status"] != "NORMAL":
+                add_error("metric_alert", f"{resource}: {recorded['status']}", "incident_ledger", observed_at)
+        if len(recorded) > 2:
+            evidence["incident_record_snapshot"] = [recorded]
+            evidence_status = "incident_snapshot"
+
     return {
         "alert": alert,
         "errors": errors,
         "evidence": evidence,
-        "evidence_status": "observed" if any(evidence.values()) else "alert_only",
+        "evidence_status": evidence_status,
         "window_minutes": 15,
     }
 
