@@ -201,6 +201,7 @@ def diagnosis_view(reply_text, engine_status, monitoring_override=False):
         "summary": (
             "Model unavailable; no diagnosis was established." if engine_status == "offline"
             else "Model response could not be validated." if engine_status == "invalid"
+            else "Diagnostic pipeline failed before a reliable assessment." if engine_status == "error"
             else "The model returned a diagnostic assessment, not proof of recovery."
         ),
         "incident_detected_in_response": parsed.get("incident_detected") if isinstance(parsed.get("incident_detected"), bool) else None,
