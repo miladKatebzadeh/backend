@@ -144,6 +144,8 @@ class StandaloneCollectorDaemon:
             status = str(container.get('State') or 'unknown')
             restart_count = 0
             oom = False
+            details = {}
+            state = {}
             try:
                 inspected = requests.get(f'{base}/containers/{container_id}/json', timeout=5)
                 inspected.raise_for_status()
@@ -182,12 +184,24 @@ class StandaloneCollectorDaemon:
                 except Exception:
                     logger.exception('Docker stats failed for %s', name)
 
+            try:
+                exit_code = int(state['ExitCode']) if state.get('ExitCode') is not None else None
+            except (TypeError, ValueError):
+                exit_code = None
             payload = {
                 'status': status,
                 'cpu_percent': cpu_percent,
                 'mem_usage_mb': mem_usage_mb,
                 'oom_killed': oom,
-                'raw_stats': {'cpu_percent': cpu_percent, 'mem_usage_mb': mem_usage_mb, 'restart_count': restart_count},
+                'raw_stats': {
+                    'cpu_percent': cpu_percent,
+                    'mem_usage_mb': mem_usage_mb,
+                    'restart_count': restart_count,
+                    'exit_code': exit_code,
+                    'state_error': str(state.get('Error') or '')[:240],
+                    'finished_at': str(state.get('FinishedAt') or '')[:80],
+                    'image': str((details.get('Config') or {}).get('Image') or container.get('Image') or '')[:200],
+                },
                 'container_logs': container_logs,
                 'restart_count': restart_count,
                 'timestamp': timezone.now(),

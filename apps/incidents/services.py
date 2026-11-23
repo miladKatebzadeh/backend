@@ -211,6 +211,8 @@ def sync_incidents_from_telemetry() -> dict:
                 'container_status': state,
                 'restart_count': row.restart_count,
                 'oom_killed': row.oom_killed,
+                'exit_code': (row.raw_stats or {}).get('exit_code') if isinstance(row.raw_stats, dict) else None,
+                'state_error': str((row.raw_stats or {}).get('state_error') or '')[:240] if isinstance(row.raw_stats, dict) else '',
                 'log_excerpt': _excerpt(row.container_logs),
             },
         )

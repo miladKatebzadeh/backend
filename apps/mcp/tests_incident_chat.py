@@ -61,10 +61,13 @@ class IncidentChatTests(TestCase):
         self.assertEqual(response.data["incident_id"], self.incident.pk)
         args, kwargs = diagnose.call_args
         self.assertIn("Container grafana exited", args[0])
-        self.assertIn("grafana: out of memory", args[0])
+        self.assertIn("INCIDENT RECORD", args[0])
         self.assertNotIn("secret data from unrelated container", args[0])
         self.assertFalse(kwargs["allow_remediation"])
-        self.assertEqual(kwargs["resource_scope"], {"source": "docker", "resource": "grafana"})
+        self.assertEqual(kwargs["resource_scope"]["source"], "docker")
+        self.assertEqual(kwargs["resource_scope"]["resource"], "grafana")
+        self.assertEqual(kwargs["resource_scope"]["incident_id"], self.incident.pk)
+        self.assertEqual(kwargs["observed_at"], self.incident.last_seen)
 
     @patch("apps.mcp.views.diagnose")
     def test_follow_up_includes_prior_context(self, diagnose):
