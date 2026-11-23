@@ -6,6 +6,7 @@ from rest_framework.test import APIClient
 
 from apps.collector.models import DockerMetric
 from apps.incidents.models import Incident
+from apps.mcp.diagnostics import gather
 
 
 class IncidentChatTests(TestCase):
@@ -62,6 +63,7 @@ class IncidentChatTests(TestCase):
         self.assertIn("grafana: out of memory", args[0])
         self.assertNotIn("secret data from unrelated container", args[0])
         self.assertFalse(kwargs["allow_remediation"])
+        self.assertEqual(kwargs["resource_scope"], {"source": "docker", "resource": "grafana"})
 
     @patch("apps.mcp.views.diagnose")
     def test_follow_up_includes_prior_context(self, diagnose):
@@ -99,6 +101,15 @@ class IncidentChatTests(TestCase):
         )
         self.assertEqual(invalid.status_code, 400)
         diagnose.assert_not_called()
+
+    def test_diagnostic_gather_excludes_other_resource(self):
+        evidence = gather(
+            {"need_container_events": True, "need_ci_logs": True},
+            resource_scope={"source": "docker", "resource": "grafana"},
+        )
+        self.assertEqual(len(evidence["container_telemetry"]), 1)
+        self.assertEqual(evidence["container_telemetry"][0]["container"], "grafana")
+        self.assertEqual(evidence["ci_pipeline_logs"], [])
 
     @patch("apps.mcp.views.diagnose")
     def test_malformed_history_rejected(self, diagnose):
