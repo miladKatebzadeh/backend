@@ -71,6 +71,35 @@ def ollama_error_details(exc, model):
     }
 
 
+def offline_diagnosis(context, error):
+    """Backward-compatible JSON reply with monitoring truth, not a false negative."""
+    alert = (context or {}).get("alert") or {}
+    confirmed = observed_incident(context)
+    resource = safe_text(alert.get("resource") or "سیستم", 100)
+    source = safe_text(alert.get("source") or "پایش", 80)
+    report = (
+        f"خرابی {resource} در {source} توسط سامانه پایش ثبت شده است. "
+        "مدل هوش مصنوعی در حال حاضر پاسخ نداده و علت ریشه‌ای هنوز تأیید نشده است. "
+        "برای ادامه بررسی، شواهد ثبت‌شده و لاگ مربوط به همان منبع را بررسی کنید."
+        if confirmed
+        else "پاسخ هوش مصنوعی دریافت نشد. بدون شواهد مستقل نمی‌توان وضعیت سیستم یا علت مشکل را تأیید کرد."
+    )
+    return json.dumps({
+        "incident_detected": confirmed,
+        "error_scope": safe_text(alert.get("family") or "engine", 100),
+        "engine_status": "offline",
+        "diagnostic_report": report,
+        "evidence_refs": [
+            safe_text(item.get("source"), 80)
+            for item in ((context or {}).get("errors") or [])[:4]
+            if isinstance(item, dict) and item.get("source")
+        ],
+        "ollama_error": error,
+        "tool_name": "",
+        "tool_target": "",
+    }, ensure_ascii=False)
+
+
 def _list_of_text(value, limit=4, max_chars=230):
     if not isinstance(value, list):
         return []
