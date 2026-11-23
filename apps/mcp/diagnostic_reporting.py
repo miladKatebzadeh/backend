@@ -153,8 +153,8 @@ def _manual_log_handoff(text):
     """A diagnostics product must not make the end user research raw logs."""
     lowered = text.lower()
     return bool(re.search(
-        r"\\b(?:check|review|inspect|open|read|examine|search|look at)\\b"
-        r".{0,50}\\b(?:logs?|console|trace|debugging output)\\b",
+        r"\b(?:check|review|inspect|open|read|examine|search|look at)\b"
+        r".{0,50}\b(?:logs?|console|trace|debugging output)\b",
         lowered,
     )) or any(term in lowered for term in (
         "a complete log of this run", "npm help ci", "/tmp/.npm/_logs",
