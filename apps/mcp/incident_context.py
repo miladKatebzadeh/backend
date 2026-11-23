@@ -161,6 +161,10 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 "status": row.alert_status,
                 "value": row.value,
                 "type": row.metric_type,
+                "labels": {
+                    _redact(key, 60): _redact(value, 100)
+                    for key, value in (row.labels if isinstance(row.labels, dict) else {}).items()
+                },
                 "updated_at": _timestamp(row.updated_at),
             }
             evidence["metric_window_anomalies"].append(entry)
