@@ -102,6 +102,22 @@ class IncidentChatTests(TestCase):
         self.assertEqual(invalid.status_code, 400)
         diagnose.assert_not_called()
 
+    @patch("apps.mcp.views.diagnose")
+    def test_explicit_remediation_approval_reaches_engine(self, diagnose):
+        diagnose.return_value = {
+            "reply": '{"incident_detected": true, "diagnostic_report": "Recovery proposed"}',
+            "engine_status": "ok",
+            "agent_automation": {"agent_triggered": False},
+            "decisions": {},
+        }
+        response = self.client.post(
+            "/api/mcp/chat/",
+            {"incident_id": self.incident.pk, "message": "Apply recommended fix", "remediate": True},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(diagnose.call_args.kwargs["allow_remediation"])
+
     def test_diagnostic_gather_excludes_other_resource(self):
         evidence = gather(
             {"need_container_events": True, "need_ci_logs": True},
