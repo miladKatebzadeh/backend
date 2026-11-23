@@ -222,19 +222,19 @@ def remediation_view(requested, agent):
     sandbox = agent.get("sandbox_output") or {}
     success = executed and bool(sandbox.get("success"))
     verified = executed and bool(agent.get("resolved"))
-    if not requested:
+    if verified:
+        status, summary = "verified_recovery", "A remediation tool ran and resource recovery was verified."
+    elif success:
+        status, summary = "executed_unverified", "Tool execution completed; resource recovery was not verified."
+    elif executed:
+        status, summary = "failed", "A remediation tool was attempted but did not succeed."
+    elif not requested:
         status, summary = "not_requested", "Diagnosis only. No remediation tool was authorized or executed."
-    elif not executed:
+    else:
         status, summary = "not_executed", (
             "Remediation was authorized, but no tool ran."
             + (" Reason: " + safe_text(agent.get("error"), 220) if agent.get("error") else "")
         )
-    elif verified:
-        status, summary = "verified_recovery", "A remediation tool ran and resource recovery was verified."
-    elif success:
-        status, summary = "executed_unverified", "Tool execution completed; resource recovery was not verified."
-    else:
-        status, summary = "failed", "A remediation tool was attempted but did not succeed."
     return {
         "status": status,
         "summary": summary,
