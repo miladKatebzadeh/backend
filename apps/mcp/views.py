@@ -312,7 +312,16 @@ def mcp_ai_chat(request):
     # Incident-linked calls need an explicit remediation flag, even if auto mode is on.
     allow_remediation = requested if incident is not None else (auto or requested)
     resource_scope = {'source': incident.source, 'resource': incident.resource} if incident is not None else None
-    result = diagnose(user_message, allow_remediation=allow_remediation, resource_scope=resource_scope)
+    routing_message = (
+        f"{incident.source} {incident.title}. {incident.description[:350]}"
+        if incident is not None else None
+    )
+    result = diagnose(
+        user_message,
+        allow_remediation=allow_remediation,
+        resource_scope=resource_scope,
+        routing_message=routing_message,
+    )
     decisions = result.get('decisions') or {}
     return response.Response({
         'reply': result['reply'],
