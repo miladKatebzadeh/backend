@@ -917,6 +917,7 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
     engine_status = 'ok'
     reply_text = ''
     agent = {'agent_triggered': False, 'sandbox_output': None}
+    monitoring_override = False
     try:
         with _child_span(langfuse, STAGES['context'], {
             'source': (incident_context.get('alert') or {}).get('source'),
@@ -1076,6 +1077,7 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
                     'failure', 'unstable', 'aborted', 'firing', 'critical', 'warning',
                 }
                 if observed_status in active_statuses and not parsed['incident_detected']:
+                    monitoring_override = True
                     alert = incident_context['alert']
                     parsed['incident_detected'] = True
                     parsed['diagnostic_report'] = (
@@ -1101,7 +1103,7 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
         _close_trace(handle, trace_summary(
             incident_context, routing_message or user_message,
             route_view, retrieval, reply_text, engine_status, agent,
-            allow_remediation, query=query,
+            allow_remediation, query=query, monitoring_override=monitoring_override,
         ))
     return {
         'reply': reply_text,
