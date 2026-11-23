@@ -228,6 +228,47 @@ class CrossSourceContextTests(TestCase):
         trace = context_view(ctx)
         self.assertEqual(trace["source_assessment"]["category"], "port_conflict")
 
+    @patch("apps.mcp.diagnostics.get_langfuse", return_value=None)
+    @patch("apps.mcp.diagnostics.active_tool_catalog", return_value=[])
+    @patch("apps.mcp.diagnostics.retrieve", return_value={
+        "results": [], "source": "none", "candidate_count": 0, "filters": {},
+    })
+    @patch("apps.mcp.diagnostics.route", return_value={
+        "router": "keywords", "incident_family": "container_runtime",
+        "need_container_events": True, "need_runbook_search": True,
+    })
+    @patch("apps.mcp.diagnostics._chat", return_value=json.dumps({
+        "incident_detected": True, "error_scope": "container_runtime",
+        "diagnostic_report": "Please inspect Docker logs manually.",
+        "evidence_refs": ["docker_inspect"],
+        "tool_name": "restart_container", "tool_target": "api",
+    }))
+    def test_docker_evidence_reaches_laya_retrieval_and_ai_without_executing_tools(
+        self, chat, route, retrieve, catalog, langfuse,
+    ):
+        from apps.mcp.diagnostics import diagnose
+
+        DockerMetric.objects.create(
+            container_name="api", status="exited", oom_killed=True,
+            raw_stats={"exit_code": 137}, container_logs="INFO service terminated",
+            timestamp=self.now,
+        )
+        result = diagnose(
+            "Docker api container exited",
+            resource_scope={"source": "docker", "resource": "api", "status": "open"},
+            observed_at=self.now, allow_remediation=False,
+        )
+        self.assertIn("OOMKilled", route.call_args.args[0])
+        self.assertIn("OOMKilled", retrieve.call_args.args[0])
+        self.assertIn("AUTOMATIC SOURCE DIAGNOSIS", chat.call_args.args[3])
+        self.assertIn("oom_killed", chat.call_args.args[3])
+        self.assertEqual(result["engine_status"], "ok")
+        report = result["user_report"]
+        self.assertIn("out-of-memory", report["root_cause"].lower())
+        self.assertNotIn("inspect Docker logs", json.dumps(report))
+        self.assertEqual(report["language"], "en")
+        self.assertFalse(result["agent_automation"]["agent_triggered"])
+
     @patch("apps.mcp.incident_context.fetch_docker_evidence")
     def test_historical_docker_incident_does_not_use_live_container_as_past_proof(self, fetch):
         past = self.now - timedelta(days=2)
@@ -278,6 +319,45 @@ class CrossSourceContextTests(TestCase):
         self.assertIn("Reclaim", report["recommended_steps"][0])
         self.assertEqual(report["source_assessment"]["time_window"]["samples"], 3)
         self.assertFalse(report["recovery_verified"])
+
+    @patch("apps.mcp.diagnostics.get_langfuse", return_value=None)
+    @patch("apps.mcp.diagnostics.active_tool_catalog", return_value=[])
+    @patch("apps.mcp.diagnostics.retrieve", return_value={
+        "results": [], "source": "none", "candidate_count": 0, "filters": {},
+    })
+    @patch("apps.mcp.diagnostics.route", return_value={
+        "router": "keywords", "incident_family": "metric_anomaly",
+        "need_metric_window": True, "need_runbook_search": True,
+    })
+    @patch("apps.mcp.diagnostics._chat", return_value=json.dumps({
+        "incident_detected": False, "error_scope": "metric_anomaly",
+        "diagnostic_report": "Everything is healthy.",
+        "evidence_refs": [], "tool_name": "", "tool_target": "",
+    }))
+    def test_monitoring_failure_overrides_false_ai_and_uses_metric_evidence(
+        self, chat, route, retrieve, catalog, langfuse,
+    ):
+        from apps.mcp.diagnostics import diagnose
+
+        PrometheusAlert.objects.create(
+            metric_name="node_memory_MemAvailable_bytes",
+            value=536870912, alert_status="CRITICAL_LOW_MEMORY",
+            metric_type="host_memory_bounds", updated_at=self.now,
+        )
+        result = diagnose(
+            "Host memory critical",
+            resource_scope={"source": "prometheus",
+                            "resource": "node_memory_MemAvailable_bytes", "status": "open"},
+            observed_at=self.now, allow_remediation=False,
+        )
+        self.assertIn("0.50 GiB", route.call_args.args[0])
+        self.assertIn("available host memory", retrieve.call_args.args[0].lower())
+        self.assertIn("AUTOMATIC SOURCE DIAGNOSIS", chat.call_args.args[3])
+        self.assertIn("host_memory_bounds", chat.call_args.args[3])
+        self.assertTrue(json.loads(result["reply"])["incident_detected"])
+        self.assertNotIn("Everything is healthy", json.dumps(result["user_report"]))
+        self.assertIn("0.50 GiB", result["user_report"]["root_cause"])
+        self.assertFalse(result["agent_automation"]["agent_triggered"])
 
     @patch("apps.mcp.incident_context.fetch_prometheus_window")
     def test_historical_metric_uses_ledger_snapshot_not_live_series(self, window):
