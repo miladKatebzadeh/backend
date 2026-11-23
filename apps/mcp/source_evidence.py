@@ -151,12 +151,17 @@ def fetch_docker_evidence(container_name):
         if not isinstance(details, dict):
             return None
         state = details.get("State") or {}
-        logs = requests.get(
-            f"{base}/containers/{identifier}/logs",
-            params={"stdout": 1, "stderr": 1, "tail": 120, "timestamps": 0},
-            timeout=(2, 4),
-        )
-        logs.raise_for_status()
+        try:
+            logs = requests.get(
+                f"{base}/containers/{identifier}/logs",
+                params={"stdout": 1, "stderr": 1, "tail": 120, "timestamps": 0},
+                timeout=(2, 4),
+            )
+            logs.raise_for_status()
+            log_text = _decode_docker_logs(logs.content)
+        except requests.RequestException:
+            # Docker inspect and OOMKilled remain useful when the log endpoint fails.
+            log_text = ""
         return {
             "status": _safe(state.get("Status") or match.get("State"), 50),
             "oom_killed": state.get("OOMKilled") is True,
@@ -165,7 +170,7 @@ def fetch_docker_evidence(container_name):
             "restart_count": details.get("RestartCount"),
             "health_status": _safe((state.get("Health") or {}).get("Status"), 50),
             "image": _safe((details.get("Config") or {}).get("Image"), 140),
-            "logs": _decode_docker_logs(logs.content),
+            "logs": log_text,
             "evidence_origin": "live_docker_read_only",
             "checked_at": timezone.now().isoformat(),
         }
@@ -282,10 +287,14 @@ def fetch_prometheus_window(metric_name, labels, observed_at):
         return None
 
 
-def fetch_active_alert(alert_name, source="prometheus"):
+def fetch_active_alert(alert_name, source="prometheus", labels=None):
     """Read the corresponding alert definition without exposing provider URLs."""
     from apps.mcp.models import get_setting
     name = str(alert_name or "").removeprefix("alert:").strip()
+    known = {
+        k: str(v) for k, v in (labels if isinstance(labels, dict) else {}).items()
+        if k in ("instance", "job", "device", "mountpoint") and v is not None
+    }
     if not name or len(name) > 180:
         return None
     if source == "alertmanager":
@@ -308,6 +317,8 @@ def fetch_active_alert(alert_name, source="prometheus"):
                 continue
             labels = row.get("labels") or {}
             if str(labels.get("alertname")) != name:
+                continue
+            if known and not all(str(labels.get(k)) == v for k, v in known.items()):
                 continue
             annotations = row.get("annotations") or {}
             state = row.get("state") or (row.get("status") or {}).get("state")
