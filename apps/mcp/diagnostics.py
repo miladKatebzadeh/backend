@@ -1138,8 +1138,9 @@ explicitly say that no matching Runbook was found.
                             'error_scope': (incident_context.get('alert') or {}).get('family') or 'engine',
                             'engine_status': 'invalid',
                             'diagnostic_report': (
-                                'سامانه پایش وجود خرابی را تأیید کرده، اما خروجی مدل قابل اعتبارسنجی نیست. '
-                                'علت اصلی هنوز مشخص نشده است. ابتدا شواهد و لاگ‌های مرتبط را بررسی کنید.'
+                                'Monitoring confirms an active incident, but the model did not '
+                                'return a valid diagnosis. Revive retained the available monitoring '
+                                'evidence; the specific underlying cause remains unverified.'
                             ),
                             'evidence_refs': ['monitored incident alert'],
                             'tool_name': '', 'tool_target': '',
