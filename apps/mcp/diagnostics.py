@@ -914,10 +914,16 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
             'message': route_input, 'snapshot': context['fleet_anomaly_snapshot']
         }, parent=parent) as laya_span:
             decisions = route(route_input, context)
+            if incident_context and decisions.get('incident_family') == 'unknown':
+                verified_family = incident_context['alert'].get('family')
+                if verified_family and verified_family != 'unknown':
+                    decisions = align_section({**decisions, 'incident_family': verified_family})
+                    decisions['family_source'] = 'verified_alert_source'
             route_view = {
                 'router': decisions.get('router', 'keywords'),
                 'laya_model': decisions.get('laya_model', ''),
                 'incident_family': decisions.get('incident_family', 'unknown'),
+                'family_source': decisions.get('family_source', 'router'),
                 'need_ci_logs': bool(decisions.get('need_ci_logs')),
                 'need_metric_window': bool(decisions.get('need_metric_window')),
                 'need_container_events': bool(decisions.get('need_container_events')),
@@ -1036,6 +1042,25 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
                 engine_status = 'invalid'
                 reply_text = _invalid_diagnosis()
             else:
+                # The Incident ledger / source alert is independent monitoring
+                # evidence. A false model classification cannot erase it.
+                observed_status = str((incident_context.get('alert') or {}).get('status') or '').lower()
+                active_statuses = {
+                    'open', 'acknowledged', 'investigating', 'exited', 'dead',
+                    'failure', 'unstable', 'aborted', 'firing', 'critical', 'warning',
+                }
+                if observed_status in active_statuses and not parsed['incident_detected']:
+                    alert = incident_context['alert']
+                    parsed['incident_detected'] = True
+                    parsed['diagnostic_report'] = (
+                        f"Monitoring confirms an active incident for {alert.get('source')}:"
+                        f"{alert.get('resource')} (status: {observed_status}). "
+                        "The diagnostic model did not establish a reliable root cause. "
+                        "Review the observed error indicators and verify recovery manually."
+                    )
+                    parsed['evidence_refs'] = ['monitored incident alert']
+                    parsed['tool_name'] = ''
+                    parsed['tool_target'] = ''
                 reply_text = json.dumps(parsed)
         if allow_remediation and engine_status == 'ok':
             allowed_target = resource_scope.get('resource') if isinstance(resource_scope, dict) else None
