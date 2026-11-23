@@ -60,6 +60,47 @@ class OllamaDiagnosticsUnitTests(SimpleTestCase):
         self.assertFalse(report["recovery_verified"])
         self.assertEqual(report["source"], "monitoring_only")
 
+    def test_persian_llm_prose_is_not_forwarded_to_an_english_user_report(self):
+        raw = json.dumps({
+            "incident_detected": True, "diagnostic_report": "مشکل را در لاگ بررسی کنید",
+            "user_report": {
+                "summary": "مشکل پیدا شد",
+                "likely_cause": "مشکل حافظه",
+                "recommended_steps": ["لاگ را بررسی کنید"],
+                "verification_steps": ["مرحله بعد را چک کنید"],
+            },
+        }, ensure_ascii=False)
+        context = {"alert": {
+            "source": "jenkins", "resource": "CSAI",
+            "status": "open", "message": "Build #6 failed",
+        }}
+        report = readable_report(context, raw, "ok")
+        self.assertEqual(report["language"], "en")
+        self.assertIn("Monitoring", report["summary"])
+        self.assertFalse(any("\\u0600" <= ch <= "\\u06ff"
+                             for ch in json.dumps(report, ensure_ascii=False)))
+        self.assertNotIn("check logs", json.dumps(report).lower())
+
+    def test_english_model_requests_to_read_raw_logs_are_not_surfaced(self):
+        raw = json.dumps({
+            "incident_detected": True,
+            "user_report": {
+                "summary": "Review logs to see why this failed",
+                "likely_cause": "unknown",
+                "recommended_steps": [
+                    "Check the logs in Jenkins",
+                    "Re-run the frontend CI stage after correcting the issue",
+                ],
+            },
+        })
+        context = {"alert": {
+            "source": "jenkins", "resource": "CSAI", "status": "open",
+        }}
+        report = readable_report(context, raw, "ok")
+        self.assertNotIn("review logs", report["summary"].lower())
+        self.assertNotIn("check the logs", json.dumps(report).lower())
+        self.assertIn("Re-run", report["recommended_steps"][0])
+
     def test_model_assessment_is_clearly_a_hypothesis_not_a_verified_fix(self):
         raw = json.dumps({
             "incident_detected": True, "diagnostic_report": "Investigate memory constraints.",
