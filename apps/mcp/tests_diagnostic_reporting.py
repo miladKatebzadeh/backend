@@ -222,7 +222,7 @@ class OllamaDiagnosticsApiTests(TestCase):
         self.assertEqual(result.data["user_report"]["status"], "ai_unusable")
         self.assertFalse(result.data["action"]["triggered"])
 
-    def test_healthy_model_provides_structured_english_summary(self):
+    def test_healthy_model_cannot_replace_unknown_jenkins_cause_with_unguarded_advice(self):
         output = json.dumps({
             "incident_detected": True, "error_scope": "ci_failure",
             "diagnostic_report": "The build failed; the exact cause remains unknown.",
@@ -243,6 +243,9 @@ class OllamaDiagnosticsApiTests(TestCase):
         report = result.data["user_report"]
         self.assertIn("CSAI", report["summary"])
         self.assertEqual(report["runbook_count"], 0)
-        self.assertEqual(report["recommended_steps"], ["Correct the frontend dependency installation failure."])
-        self.assertIn("not yet verified", report["root_cause"])
+        # Only generic exit status was collected: reject the model's
+        # unsupported dependency-installation fix, even when engine_status=ok.
+        self.assertNotIn("Correct the frontend dependency", json.dumps(report["recommended_steps"]))
+        self.assertIn("could not isolate", report["recommended_steps"][0])
+        self.assertIn("could not establish", report["root_cause"])
         self.assertFalse(report["recovery_verified"])

@@ -681,6 +681,9 @@ def gather(decisions: dict, resource_scope=None) -> dict:
             for row in _recent(jenkins_rows, 'updated_at', limit=3)
         ]
     if decisions.get('need_deployment_changes'):
+        # An old successful build must not be mistaken for a recent release.
+        from datetime import timedelta
+        release_window = timezone.now() - timedelta(hours=6)
         payload['deployment_changes'] = [
             {
                 'job': row.job_name,
@@ -688,7 +691,9 @@ def gather(decisions: dict, resource_scope=None) -> dict:
                 'result': row.result,
                 'updated_at': _stamp(row.updated_at),
             }
-            for row in _recent(jenkins_rows, 'updated_at')
+            for row in jenkins_rows.filter(
+                updated_at__gte=release_window,
+            ).order_by('-updated_at', '-id')[:5]
         ]
     return payload
 
@@ -1007,7 +1012,11 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
                 if isinstance(row, dict) and isinstance(row.get('failure_analysis'), dict):
                     pipeline_failure = row['failure_analysis']
                     break
-        packet = _compact(f"""JENKINS CONSOLE FAILURE ANALYSIS (observations, not assumed root cause):
+        source_assessment = incident_context.get('source_assessment') if incident_context else None
+        packet = _compact(f"""AUTOMATIC SOURCE DIAGNOSIS (read-only provider evidence):
+{json.dumps(source_assessment, ensure_ascii=False) if source_assessment else 'No source-specific analysis was established.'}
+
+JENKINS CONSOLE FAILURE ANALYSIS (observations, not assumed root cause):
 {json.dumps(pipeline_failure, ensure_ascii=False) if pipeline_failure else 'No Jenkins-specific failure analysis available.'}
 
 OBSERVED INCIDENT CONTEXT (independent monitoring facts):
@@ -1037,6 +1046,17 @@ An OBSERVED INCIDENT CONTEXT is monitoring evidence and must not be contradicted
 an unsupported model classification. If telemetry says a container exited or a
 build failed, report the observed incident even when the root cause is unknown.
 Separate actual observations from suggested commands and unverified hypotheses.
+For linked Docker or Prometheus incidents, examine AUTOMATIC SOURCE DIAGNOSIS
+first. It contains bounded, read-only provider observations (Docker inspect,
+container startup errors, OOMKilled, metric samples, firing alert labels).
+A live provider recheck does not rewrite the historical incident event and
+is NOT evidence of recovery. Do not assume a Docker exit code 137 confirms OOM;
+only OOMKilled=true confirms an OOM termination. A firing alert describes an
+observed condition, not its process-level cause.
+For deployment-related questions, Jenkins build timing alone is not proof that
+a particular release caused a failure; require a confirmed resource/release link.
+Never instruct the user to inspect Docker logs, Prometheus dashboards or
+Alertmanager pages: Revive must present the collected observations and next steps.
 For Jenkins incidents, examine JENKINS CONSOLE FAILURE ANALYSIS first.
 A specific primary_error is a verbatim observed error, not proof of its ultimate
 root cause. Explain the failed stage and command when they are supported by logs.
@@ -1210,6 +1230,7 @@ explicitly say that no matching Runbook was found.
     user_report = readable_report(
         incident_context, reply_text, engine_status, agent=agent,
         retrieval=retrieval, error=ollama_error,
+        operational_evidence=evidence, decisions=decisions,
     )
     return {
         'reply': reply_text,

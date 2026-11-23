@@ -13,6 +13,10 @@ from apps.mcp.jenkins_evidence import (
     ANALYZER_VERSION, analyze_jenkins_console, fetch_jenkins_build_console,
     select_jenkins_console,
 )
+from apps.mcp.source_evidence import (
+    analyze_docker_observation, analyze_metric_observation,
+    fetch_docker_evidence, fetch_prometheus_window, fetch_active_alert,
+)
 
 
 _ERROR_LINE = re.compile(
@@ -66,6 +70,14 @@ def _scope_window(observed_at, window_minutes=15):
     )
 
 
+def _can_check_live(resource_scope, observed_at):
+    """Only incident-linked recent signals permit additional live provider reads."""
+    if not resource_scope.get("incident_id") or observed_at is None:
+        return False
+    seconds = (timezone.now() - observed_at).total_seconds()
+    return -90 <= seconds <= 20 * 60
+
+
 def build_incident_context(message, resource_scope=None, observed_at=None):
     """Return one structured, source-scoped diagnosis input.
 
@@ -88,6 +100,8 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
     }
     errors = []
     evidence = {}
+    source_assessment = None
+    can_check_live = _can_check_live(resource_scope, observed_at)
 
     def add_error(kind, text, origin, timestamp):
         if len(errors) < 6:
@@ -105,7 +119,8 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
             ).order_by("-timestamp", "-id")[:2]
         )
         evidence["container_telemetry"] = []
-        for row in rows:
+        live = None
+        for index, row in enumerate(rows):
             stats = row.raw_stats if isinstance(row.raw_stats, dict) else {}
             state_error = _redact(stats.get("state_error"))
             exit_code = stats.get("exit_code")
@@ -123,15 +138,57 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 "timestamp": _timestamp(row.timestamp),
                 "log_errors": _error_lines(row.container_logs),
             }
+            baseline = analyze_docker_observation({
+                **entry, "logs": row.container_logs, "state_error": state_error,
+            })
+            analysis = baseline
+            if index == 0 and can_check_live and (
+                baseline["diagnostic_status"] == "insufficient_evidence"
+                or (baseline["category"] == "out_of_memory" and not row.oom_killed)
+            ):
+                live = fetch_docker_evidence(resource)
+                if isinstance(live, dict) and live.get("status") != "not_found":
+                    inspected = analyze_docker_observation(live)
+                    if inspected["diagnostic_status"] != "insufficient_evidence":
+                        analysis = inspected
+                entry["live_check"] = {
+                    "status": (live or {}).get("status") if isinstance(live, dict) else "unavailable",
+                    "checked_at": (live or {}).get("checked_at") if isinstance(live, dict) else None,
+                    "origin": "live_docker_read_only",
+                    "recovery_verified": False,
+                }
+            entry["failure_analysis"] = analysis
             evidence["container_telemetry"].append(entry)
+            if index == 0:
+                source_assessment = analysis
             if row.oom_killed:
                 add_error("oom_killed", "Docker reports OOMKilled=true", "docker_inspect", row.timestamp)
+            elif analysis.get("primary_error"):
+                add_error(
+                    "container_failure", analysis["primary_error"], analysis["evidence_origin"],
+                    timezone.now() if analysis.get("evidence_origin") == "live_docker_read_only" else row.timestamp,
+                )
             if exit_code not in (None, "", 0, "0"):
-                add_error("exit_code", f"Container exit code {exit_code}", "docker_inspect", row.timestamp)
-            if state_error:
+                add_error("exit_code", f"Container exit code {exit_code}; exit status is not a root cause", "docker_inspect", row.timestamp)
+            if state_error and not row.oom_killed:
                 add_error("state_error", state_error, "docker_inspect", row.timestamp)
-            for line in entry["log_errors"]:
+            for line in entry["log_errors"][:2]:
                 add_error("log_error", line, "docker_logs", row.timestamp)
+        if not rows and can_check_live:
+            live = fetch_docker_evidence(resource)
+            if isinstance(live, dict) and live.get("status") not in ("not_found", None):
+                analysis = analyze_docker_observation(live)
+                evidence["container_telemetry"].append({
+                    "container": resource,
+                    "status": live.get("status"),
+                    "timestamp": live.get("checked_at"),
+                    "failure_analysis": analysis,
+                    "live_check": {"status": live.get("status"), "origin": "live_docker_read_only",
+                                   "recovery_verified": False},
+                })
+                source_assessment = analysis
+                if analysis.get("primary_error"):
+                    add_error("container_failure", analysis["primary_error"], "live_docker_read_only", timezone.now())
     elif resource and start <= end and source == "jenkins":
         # Keep the Incident's exact build, not another failure in the same job
         # that happened within the correlation time window.
@@ -205,7 +262,7 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
             ).order_by("-updated_at", "-id")[:2]
         )
         evidence["metric_window_anomalies"] = []
-        for row in rows:
+        for index, row in enumerate(rows):
             entry = {
                 "metric": row.metric_name,
                 "status": row.alert_status,
@@ -217,14 +274,21 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 },
                 "updated_at": _timestamp(row.updated_at),
             }
+            if can_check_live and index == 0 and str(row.metric_name).startswith("alert:"):
+                details = fetch_active_alert(row.metric_name, source=source, labels=row.labels)
+                if isinstance(details, dict):
+                    entry["alert_detail"] = details
+            if can_check_live and index == 0 and not str(row.metric_name).startswith("alert:"):
+                window = fetch_prometheus_window(row.metric_name, row.labels, observed_at)
+                if isinstance(window, dict):
+                    entry["metric_window"] = window
+            analysis = analyze_metric_observation(entry, entry.get("metric_window"))
+            entry["failure_analysis"] = analysis
             evidence["metric_window_anomalies"].append(entry)
+            if index == 0:
+                source_assessment = analysis
             if str(row.alert_status).upper() != "NORMAL":
-                add_error(
-                    "metric_alert",
-                    f"{row.metric_name}: {row.alert_status} (value={row.value})",
-                    row.metric_type,
-                    row.updated_at,
-                )
+                add_error("metric_alert", analysis["issue"], row.metric_type, row.updated_at)
 
     evidence_status = "observed" if any(evidence.values()) else "alert_only"
 
@@ -243,6 +307,11 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 "state_error": _redact(snapshot.get("state_error")),
                 "log_errors": _error_lines(snapshot.get("log_excerpt")),
             })
+            recorded["failure_analysis"] = analyze_docker_observation({
+                **recorded, "logs": snapshot.get("log_excerpt"),
+                "evidence_origin": "incident_ledger_snapshot",
+            })
+            source_assessment = recorded["failure_analysis"]
             if recorded["oom_killed"]:
                 add_error("oom_killed", "Incident snapshot reports OOMKilled=true", "incident_ledger", observed_at)
             if recorded["exit_code"] not in (None, "", 0, "0"):
@@ -273,10 +342,14 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 )
         elif source in ("prometheus", "alertmanager"):
             recorded.update({
+                "metric": resource,
                 "value": snapshot.get("value"),
                 "status": _redact(snapshot.get("alert_status")),
                 "type": _redact(snapshot.get("metric_type")),
+                "labels": snapshot.get("labels") if isinstance(snapshot.get("labels"), dict) else {},
             })
+            recorded["failure_analysis"] = analyze_metric_observation(recorded)
+            source_assessment = recorded["failure_analysis"]
             if recorded["status"] and recorded["status"] != "NORMAL":
                 add_error("metric_alert", f"{resource}: {recorded['status']}", "incident_ledger", observed_at)
         if len(recorded) > 2:
@@ -289,6 +362,7 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
         "evidence": evidence,
         "evidence_status": evidence_status,
         "window_minutes": 15,
+        "source_assessment": source_assessment,
     }
 
 
@@ -298,6 +372,11 @@ def routing_context_text(incident_context, fallback_message):
         return str(fallback_message or "")
     alert = incident_context["alert"]
     pieces = [alert.get("family") or "", alert.get("message") or ""]
+    source_issue = (incident_context.get("source_assessment") or {}).get("primary_error") or (
+        incident_context.get("source_assessment") or {}
+    ).get("issue")
+    if source_issue:
+        pieces.append(str(source_issue)[:300])
     for row in (incident_context.get("evidence") or {}).get("ci_pipeline_logs", []):
         failure = row.get("failure_analysis") or {}
         if failure.get("primary_error"):
@@ -317,6 +396,11 @@ def retrieval_query_text(decisions, incident_context, fallback_message):
         return f"{family} {fallback_message}".strip()
     alert = incident_context["alert"]
     parts = [family, str(alert.get("message") or "")[:220]]
+    source_issue = (incident_context.get("source_assessment") or {}).get("primary_error") or (
+        incident_context.get("source_assessment") or {}
+    ).get("issue")
+    if source_issue:
+        parts.append(str(source_issue)[:260])
     for row in (incident_context.get("evidence") or {}).get("ci_pipeline_logs", []):
         failure = row.get("failure_analysis") or {}
         if failure.get("primary_error"):
@@ -326,7 +410,7 @@ def retrieval_query_text(decisions, incident_context, fallback_message):
             ])
             break
     for error in incident_context["errors"][:3]:
-        if error["kind"] in ("pipeline_error", "log_error", "oom_killed", "state_error", "metric_alert"):
+        if error["kind"] in ("pipeline_error", "log_error", "oom_killed", "state_error", "exit_code", "container_failure", "metric_alert"):
             parts.append(error["message"])
         if error["kind"] == "oom_killed":
             parts.append("out of memory container OOM")
