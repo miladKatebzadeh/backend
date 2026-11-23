@@ -21,7 +21,7 @@ STAGES = {
 
 _SECRET_FIELD = re.compile(r"(password|passwd|secret|token|api[_-]?key|authorization|credential|private[_-]?key)", re.I)
 _SECRET_VALUE = re.compile(
-    r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization)\s*[:=]\s*[^\s,;]+"
+    r"(?i)\b([a-z0-9_-]*(?:password|passwd|secret(?:[_-]?key)?|token|api[_-]?key|authorization|private[_-]?key))\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 _URL_PASSWORD = re.compile(r"(https?://[^:/\s]+:)[^@\s/]+(@)", re.I)
