@@ -144,7 +144,7 @@ def _default_steps(source, status):
 def _english(text):
     """Do not surface untranslated model-generated prose in English reports."""
     return isinstance(text, str) and bool(text.strip()) and not any(
-        "\\u0600" <= ch <= "\\u06ff" for ch in text
+        "\u0600" <= ch <= "\u06ff" for ch in text
     )
 
 
