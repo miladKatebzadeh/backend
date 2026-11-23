@@ -1,6 +1,10 @@
 pipeline {
     agent any
 
+    options {
+        disableConcurrentBuilds()
+    }
+
     environment {
         APP_NAME = 'opshubbackend'
         HOST_PORT = '8000'
@@ -16,20 +20,91 @@ pipeline {
 
         stage('Build Docker Image') {
             steps {
-                // وابستگی فقط داخل ایمیج نصب می‌شود. venv روی ایجنت ساخته نمی‌شود
-                // چون هم دوباره دانلود می‌شد هم با docker build به داخل ایمیج کپی می‌شد.
                 sh "docker build -t ${APP_NAME}:${BUILD_NUMBER} ."
-                sh "docker tag ${APP_NAME}:${BUILD_NUMBER} ${APP_NAME}:latest"
+            }
+        }
+
+        stage('Validate Image Startup') {
+            steps {
+                // Never replace the existing container before validating the new image.
+                sh '''
+                    set -eu
+                    image="${APP_NAME}:${BUILD_NUMBER}"
+                    candidate="${APP_NAME}-candidate-${BUILD_NUMBER}"
+
+                    docker run --rm "$image" gunicorn --version
+                    docker rm -f "$candidate" >/dev/null 2>&1 || true
+                    cleanup() { docker rm -f "$candidate" >/dev/null 2>&1 || true; }
+                    trap cleanup EXIT
+
+                    docker run -d --name "$candidate" "$image"
+                    attempt=0
+                    until docker exec "$candidate" python -c 'import json, urllib.request; result = json.load(urllib.request.urlopen("http://127.0.0.1:3000/api/health/", timeout=2)); assert result.get("status") == "ok"'; do
+                        attempt=$((attempt + 1))
+                        if [ "$attempt" -ge 12 ]; then
+                            echo "Candidate did not pass the HTTP startup check."
+                            docker logs --tail 80 "$candidate" || true
+                            exit 1
+                        fi
+                        sleep 2
+                    done
+                    echo "Candidate started and /api/health/ responded successfully."
+                '''
             }
         }
 
         stage('Deploy Container') {
             steps {
-                sh """
-                    docker stop ${APP_NAME} || true
-                    docker rm ${APP_NAME} || true
-                    docker run -d --name ${APP_NAME} --restart unless-stopped -p ${HOST_PORT}:${CONTAINER_PORT} ${APP_NAME}:latest
-                """
+                // Keep the previous container for rollback until the replacement is healthy.
+                sh '''
+                    set -eu
+                    image="${APP_NAME}:${BUILD_NUMBER}"
+                    backup="${APP_NAME}-previous"
+                    had_previous=0
+
+                    rollback() {
+                        result=$?
+                        trap - EXIT
+                        if [ "$result" -ne 0 ]; then
+                            echo "Deployment failed; restoring previous container if present."
+                            docker logs --tail 80 "$APP_NAME" || true
+                            docker rm -f "$APP_NAME" >/dev/null 2>&1 || true
+                            if [ "$had_previous" -eq 1 ]; then
+                                docker rename "$backup" "$APP_NAME" || true
+                                docker start "$APP_NAME" || true
+                            fi
+                        fi
+                        exit "$result"
+                    }
+                    trap rollback EXIT
+
+                    if docker container inspect "$APP_NAME" >/dev/null 2>&1; then
+                        docker rm -f "$backup" >/dev/null 2>&1 || true
+                        docker rename "$APP_NAME" "$backup"
+                        had_previous=1
+                        docker stop "$backup"
+                    fi
+
+                    docker run -d --name "$APP_NAME" --restart unless-stopped \
+                        -p "${HOST_PORT}:${CONTAINER_PORT}" "$image"
+
+                    attempt=0
+                    until docker exec "$APP_NAME" python -c 'import json, urllib.request; result = json.load(urllib.request.urlopen("http://127.0.0.1:3000/api/health/", timeout=2)); assert result.get("status") == "ok"'; do
+                        attempt=$((attempt + 1))
+                        if [ "$attempt" -ge 12 ]; then
+                            echo "New backend failed the HTTP startup check."
+                            exit 1
+                        fi
+                        sleep 2
+                    done
+
+                    docker tag "$image" "${APP_NAME}:latest"
+                    if [ "$had_previous" -eq 1 ]; then
+                        docker rm "$backup" || true
+                    fi
+                    trap - EXIT
+                    echo "Backend deployment passed the startup check."
+                '''
             }
         }
     }
@@ -38,9 +113,8 @@ pipeline {
         success {
             echo 'Pipeline completed successfully!'
         }
-
         failure {
-            echo 'Pipeline failed!'
+            echo 'Pipeline failed! See startup-check logs; previous container is restored if available.'
         }
     }
 }
