@@ -355,6 +355,7 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
             "primary_error": safe_text(pipeline_failure.get("primary_error"), 350) or None,
             "failing_stage": safe_text(pipeline_failure.get("failing_stage"), 110) or None,
             "failing_command": safe_text(pipeline_failure.get("failing_command"), 220) or None,
+            "evidence_origin": pipeline_failure.get("evidence_origin") or "stored_jenkins_console",
         } if pipeline_failure else None,
         "action": action,
         "recovery_verified": verified,
