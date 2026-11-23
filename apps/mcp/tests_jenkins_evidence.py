@@ -261,6 +261,40 @@ class JenkinsEvidenceFlowTests(TestCase):
 
     @patch("apps.collector.tasks.requests.get")
     @patch("apps.collector.tasks.get_setting")
+    def test_transient_console_fetch_failure_preserves_existing_build_evidence(
+        self, get_setting, http_get,
+    ):
+        analysis = analyze_jenkins_console(SAMPLE_JENKINS_CONSOLE)
+        JenkinsBuild.objects.create(
+            job_name="CSAI", build_number=6, result="FAILURE",
+            raw_build_info={"failure_analysis": analysis},
+            console_output=select_jenkins_console(SAMPLE_JENKINS_CONSOLE),
+            updated_at=self.now,
+        )
+        get_setting.side_effect = lambda key, default="": default
+
+        class Reply:
+            def __init__(self, status_code, payload=None):
+                self.status_code, self._payload = status_code, payload
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise ValueError("HTTP error")
+            def json(self):
+                return self._payload
+
+        http_get.side_effect = [
+            Reply(200, {"jobs": [{"name": "CSAI", "lastBuild": {
+                "number": 6, "result": "FAILURE", "duration": 1000,
+            }}]}),
+            Reply(503),
+        ]
+        StandaloneCollectorDaemon.collect_jenkins_data()
+        row = JenkinsBuild.objects.get(job_name="CSAI", build_number=6)
+        self.assertIn("gunicorn", row.console_output)
+        self.assertEqual(row.raw_build_info["failure_analysis"], analysis)
+
+    @patch("apps.collector.tasks.requests.get")
+    @patch("apps.collector.tasks.get_setting")
     def test_collector_persists_full_log_failure_analysis(self, get_setting, http_get):
         get_setting.side_effect = lambda key, default="": default
 
