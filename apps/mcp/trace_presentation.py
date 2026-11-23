@@ -43,7 +43,7 @@ def safe_text(value, max_chars=350):
 
 def trace_data(value, depth=0):
     """Keep JSON structure intact, even when its fields are very large."""
-    if depth >= 5:
+    if depth >= 7 and isinstance(value, (dict, list, tuple)):
         return "[nested data omitted]"
     if isinstance(value, dict):
         items = list(value.items())
@@ -247,10 +247,10 @@ def remediation_view(requested, agent):
     }
 
 
-def trace_summary(context, message, route, retrieval, reply_text, engine_status, agent, allow_remediation):
+def trace_summary(context, message, route, retrieval, reply_text, engine_status, agent, allow_remediation, query=""):
     observed = context_view(context)
     routed = routing_view(route)
-    searched = retrieval_view("", retrieval)
+    searched = retrieval_view(query, retrieval)
     diagnosis = diagnosis_view(reply_text, engine_status)
     remediation = remediation_view(allow_remediation, agent)
     return {
