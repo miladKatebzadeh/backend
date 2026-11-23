@@ -1147,13 +1147,25 @@ explicitly say that no matching Runbook was found.
                     monitoring_override = True
                     alert = incident_context['alert']
                     parsed['incident_detected'] = True
+                    found_error = pipeline_failure.get('primary_error') if pipeline_failure else None
+                    failed_stage = pipeline_failure.get('failing_stage') if pipeline_failure else None
+                    actual_error = (
+                        f" Observed Jenkins console error: {found_error}."
+                        f" Pipeline stage: {failed_stage or 'unknown'}."
+                        if found_error else " No specific failure message was found in the collected logs."
+                    )
                     parsed['diagnostic_report'] = (
                         f"Monitoring confirms an active incident for {alert.get('source')}:"
-                        f"{alert.get('resource')} (status: {observed_status}). "
-                        "The diagnostic model did not establish a reliable root cause. "
-                        "Review the observed error indicators and verify recovery manually."
+                        f"{alert.get('resource')} (status: {observed_status})."
+                        + actual_error +
+                        " The diagnostic model did not establish a verified root cause. "
+                        "Review the failure context and verify recovery manually."
                     )
-                    parsed['evidence_refs'] = ['monitored incident alert']
+                    parsed['error_scope'] = decisions.get('incident_family') or 'engine'
+                    parsed['evidence_refs'] = (
+                        ['jenkins_console', 'monitored incident alert']
+                        if found_error else ['monitored incident alert']
+                    )
                     parsed['tool_name'] = ''
                     parsed['tool_target'] = ''
                 reply_text = json.dumps(parsed)
