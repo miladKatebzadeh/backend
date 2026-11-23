@@ -15,6 +15,14 @@ _DOCKER_ACTIONS = {
         ],
         ["Confirm the container stays running and subsequent Docker samples report OOMKilled=false."],
     ),
+    "out_of_memory": (
+        "The application reported a memory-allocation failure, but Docker did not independently confirm an OOMKilled termination.",
+        [
+            "Reduce application memory pressure or increase its configured capacity based on observed usage.",
+            "Retry startup only after the memory condition has been addressed.",
+        ],
+        ["Confirm the application stays running and check Docker OOMKilled and memory-pressure metrics."],
+    ),
     "disk_full": (
         "The container reported that the filesystem has no available space.",
         [
