@@ -52,7 +52,7 @@ def _telemetry_for_incident(incident):
 def _safe_history(history):
     """Only role/text pairs, with a bounded token budget and no trusted status."""
     turns = []
-    for item in history[-8:]:
+    for item in history[-6:]:
         if not isinstance(item, dict) or item.get("role") not in ("user", "assistant"):
             continue
         text = item.get("text")
@@ -68,7 +68,7 @@ def _safe_history(history):
                     text = str(parsed.get("diagnostic_report") or text)
             except (ValueError, TypeError):
                 pass
-        turns.append({"role": item["role"], "text": text[:650]})
+        turns.append({"role": item["role"], "text": text[:350]})
     return turns
 
 
