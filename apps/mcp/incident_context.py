@@ -161,7 +161,10 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
             if row.oom_killed:
                 add_error("oom_killed", "Docker reports OOMKilled=true", "docker_inspect", row.timestamp)
             elif analysis.get("primary_error"):
-                add_error("container_failure", analysis["primary_error"], analysis["evidence_origin"], row.timestamp)
+                add_error(
+                    "container_failure", analysis["primary_error"], analysis["evidence_origin"],
+                    timezone.now() if analysis.get("evidence_origin") == "live_docker_read_only" else row.timestamp,
+                )
             if exit_code not in (None, "", 0, "0"):
                 add_error("exit_code", f"Container exit code {exit_code}; exit status is not a root cause", "docker_inspect", row.timestamp)
             if state_error and not row.oom_killed:
