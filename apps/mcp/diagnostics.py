@@ -1081,12 +1081,17 @@ def monitor_incident_daemon():
 
     auto = str(get_setting('auto_remediate', '0')).lower() in ('1', 'true', 'yes', 'on')
     cutoff = timezone.now() - timedelta(minutes=10)
+    try:
+        interval = int(get_setting('scrape_interval', '15'))
+    except (TypeError, ValueError):
+        interval = 15
+    freshness_cutoff = timezone.now() - timedelta(seconds=max(60, min(max(interval, 5), 3600) * 3))
     docker_row = None
     jenkins_row = None
     try:
         recent = DockerMetric.objects.filter(last_attempt_at__gte=cutoff)
         docker_row = (
-            DockerMetric.objects.exclude(status='running')
+            DockerMetric.objects.filter(status__in=('exited', 'dead'), timestamp__gte=freshness_cutoff)
             .filter(remediation_attempted=False)
             .exclude(pk__in=recent.values('pk'))
             .order_by('-id')
@@ -1095,7 +1100,11 @@ def monitor_incident_daemon():
         if docker_row is None:
             jenkins_recent = JenkinsBuild.objects.filter(last_attempt_at__gte=cutoff)
             jenkins_row = (
-                JenkinsBuild.objects.filter(result__in=('FAILURE', 'UNSTABLE', 'ABORTED'), remediation_attempted=False)
+                JenkinsBuild.objects.filter(
+                    result__in=('FAILURE', 'UNSTABLE', 'ABORTED'),
+                    updated_at__gte=freshness_cutoff,
+                    remediation_attempted=False,
+                )
                 .exclude(pk__in=jenkins_recent.values('pk'))
                 .order_by('-id')
                 .first()
@@ -1112,12 +1121,29 @@ def monitor_incident_daemon():
             f"System Alert: Jenkins job '{jenkins_row.job_name}' build #{jenkins_row.build_number} "
             f"terminated with status '{jenkins_row.result}'."
         )
-    result = diagnose(message, allow_remediation=auto)
+    if docker_row is not None:
+        scope = {
+            'source': 'docker',
+            'resource': docker_row.container_name,
+            'status': docker_row.status,
+        }
+        observed_at = docker_row.timestamp
+    else:
+        scope = {
+            'source': 'jenkins',
+            'resource': jenkins_row.job_name,
+            'status': jenkins_row.result,
+        }
+        observed_at = jenkins_row.updated_at
+    result = diagnose(
+        message, allow_remediation=auto, resource_scope=scope,
+        routing_message=message, observed_at=observed_at,
+    )
     now = timezone.now()
     agent = result.get('agent_automation') or {}
     if docker_row is not None:
         docker_row.last_attempt_at = now
-        if result.get('engine_status') == 'ok':
+        if agent.get('agent_triggered'):
             docker_row.remediation_attempted = True
         state = None
         if agent.get('agent_triggered'):
@@ -1127,7 +1153,7 @@ def monitor_incident_daemon():
         docker_row.save(update_fields=['last_attempt_at', 'remediation_attempted', 'resolved'])
     if jenkins_row is not None:
         jenkins_row.last_attempt_at = now
-        if result.get('engine_status') == 'ok':
+        if agent.get('agent_triggered'):
             jenkins_row.remediation_attempted = True
         jenkins_row.save(update_fields=['last_attempt_at', 'remediation_attempted'])
     return result
