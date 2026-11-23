@@ -101,6 +101,30 @@ class OllamaDiagnosticsUnitTests(SimpleTestCase):
         self.assertNotIn("check the logs", json.dumps(report).lower())
         self.assertIn("Re-run", report["recommended_steps"][0])
 
+    def test_model_cannot_invent_lockfile_cause_from_npm_footer_only(self):
+        ctx = {
+            "alert": {"source": "jenkins", "resource": "CSAI", "status": "open"},
+            "evidence": {"ci_pipeline_logs": [{"failure_analysis": {
+                "diagnostic_status": "insufficient_console_detail",
+                "primary_error": None,
+                "failing_stage": "Frontend tests",
+            }}]},
+        }
+        raw = json.dumps({
+            "incident_detected": True,
+            "diagnostic_report": "The package lock is definitely broken.",
+            "user_report": {
+                "summary": "The package lock is definitely broken.",
+                "likely_cause": "package-lock.json mismatch",
+                "recommended_steps": ["Rewrite the lockfile now."],
+            },
+        })
+        report = readable_report(ctx, raw, "ok")
+        self.assertNotIn("definitely", report["summary"])
+        self.assertNotIn("mismatch", report["root_cause"])
+        self.assertNotIn("Rewrite", json.dumps(report["recommended_steps"]))
+        self.assertIn("could not", report["root_cause"].lower())
+
     def test_model_assessment_is_clearly_a_hypothesis_not_a_verified_fix(self):
         raw = json.dumps({
             "incident_detected": True, "diagnostic_report": "Investigate memory constraints.",
