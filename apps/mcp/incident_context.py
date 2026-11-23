@@ -10,7 +10,8 @@ from django.utils import timezone
 
 from apps.collector.models import DockerMetric, JenkinsBuild, PrometheusAlert
 from apps.mcp.jenkins_evidence import (
-    analyze_jenkins_console, fetch_jenkins_build_console, select_jenkins_console,
+    ANALYZER_VERSION, analyze_jenkins_console, fetch_jenkins_build_console,
+    select_jenkins_console,
 )
 
 
@@ -152,7 +153,7 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
             cached = rows[0] if rows else None
             saved_info = cached.raw_build_info if cached and isinstance(cached.raw_build_info, dict) else {}
             previous = saved_info.get("failure_analysis")
-            if not isinstance(previous, dict):
+            if not isinstance(previous, dict) or previous.get("analyzer_version") != ANALYZER_VERSION:
                 previous = analyze_jenkins_console(cached.console_output if cached else snapshot.get("console_excerpt"))
             if not previous.get("primary_error"):
                 console = fetch_jenkins_build_console(resource, number)
@@ -173,7 +174,7 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
         for row in rows:
             build_info = row.raw_build_info if isinstance(row.raw_build_info, dict) else {}
             analysis = build_info.get("failure_analysis")
-            if not isinstance(analysis, dict):
+            if not isinstance(analysis, dict) or analysis.get("analyzer_version") != ANALYZER_VERSION:
                 analysis = analyze_jenkins_console(row.console_output)
             entry = {
                 "job": row.job_name,
@@ -252,7 +253,7 @@ def build_incident_context(message, resource_scope=None, observed_at=None):
                 add_error("log_error", line, "incident_ledger", observed_at)
         elif source == "jenkins":
             analysis = snapshot.get("failure_analysis")
-            if not isinstance(analysis, dict):
+            if not isinstance(analysis, dict) or analysis.get("analyzer_version") != ANALYZER_VERSION:
                 analysis = analyze_jenkins_console(snapshot.get("console_excerpt"))
             recorded.update({
                 "build_number": snapshot.get("build_number"),
