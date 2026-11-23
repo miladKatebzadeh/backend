@@ -17,7 +17,7 @@ class MCPToolApiTests(APITestCase):
     def setUp(self):
         self.langfuse = patch('apps.mcp.diagnostics.get_langfuse', return_value=None)
         self.laya = patch('apps.mcp.diagnostics.get_laya', return_value=None)
-        self.chroma = patch('apps.mcp.diagnostics.get_chroma_collection', return_value=None)
+        self.chroma = patch('apps.knowledge.retrieval.get_chroma_collection', return_value=None)
         self.langfuse.start()
         self.laya.start()
         self.chroma.start()
@@ -275,15 +275,27 @@ class MCPToolApiTests(APITestCase):
         self.assertEqual(posted['auth'], ('pk-lf-test-public', 'sk-lf-test-secret'))
         batch = posted['json']['batch']
         names = [event['body']['name'] for event in batch]
-        self.assertEqual(names[0], 'hierarchical_diagnostic_routing')
-        self.assertEqual(names[1:], ['laya', 'chromadb', 'telemetry', 'llm'])
+        from apps.mcp.trace_presentation import STAGES, TRACE_SCHEMA
+
+        self.assertEqual(names[0], 'Revive | Incident diagnosis')
+        self.assertEqual(names[1:], [
+            STAGES['context'], STAGES['routing'], STAGES['retrieval'],
+            STAGES['telemetry'], STAGES['llm'], STAGES['remediation'],
+        ])
         self.assertEqual(batch[0]['type'], 'trace-create')
-        self.assertEqual(batch[0]['body']['output']['engine_status'], 'ok')
-        self.assertEqual(batch[0]['body']['output']['laya']['incident_family'], 'container_runtime')
-        self.assertIn('runbooks', batch[0]['body']['output']['chromadb'])
+        trace_output = batch[0]['body']['output']
+        self.assertEqual(trace_output['schema_version'], TRACE_SCHEMA)
+        self.assertEqual(trace_output['overview']['ai_status'], 'ok')
+        self.assertFalse(trace_output['overview']['recovery_verified'])
+        self.assertEqual(trace_output['routing']['incident_family'], 'container_runtime')
+        self.assertIn('top_matches', trace_output['runbook_search'])
+        self.assertEqual(batch[2]['body']['input']['message'], 'container web exited')
+        self.assertNotEqual(batch[2]['body']['input'], batch[2]['body']['output'])
         self.assertTrue(all(event['body']['traceId'] == batch[0]['body']['id'] for event in batch[1:]))
-        self.assertEqual(batch[-1]['type'], 'generation-create')
+        self.assertIn('generation-create', [event['type'] for event in batch])
+        self.assertEqual(batch[-1]['body']['output']['status'], 'not_requested')
         self.assertNotIn('/api/public/otel', posted['url'])
+        self.assertTrue(result.data['trace_id'])
 
     def test_langfuse_base_url_drops_the_otel_suffix(self):
         saved = self.client.post('/api/mcp/settings/', {

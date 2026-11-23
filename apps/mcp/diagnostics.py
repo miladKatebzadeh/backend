@@ -17,6 +17,18 @@ from apps.knowledge.retrieval import retrieve_runbooks
 from apps.mcp.incident_context import build_incident_context, retrieval_query_text, routing_context_text
 from apps.mcp.models import MCPTool, get_setting
 from apps.mcp.runtime import MCPSandboxExecutor
+from apps.mcp.trace_presentation import (
+    STAGES,
+    TRACE_SCHEMA,
+    context_view,
+    diagnosis_view,
+    remediation_view,
+    retrieval_view,
+    routing_view,
+    trace_data,
+    trace_input,
+    trace_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,15 +224,16 @@ class _Observation:
 
 
 class _Trace(_Observation):
-    def __init__(self, name, payload):
+    def __init__(self, name, payload, metadata=None):
         super().__init__(name, payload, kind='trace')
         self.children = []
+        self.metadata = metadata or {}
 
 
-def _open_trace(langfuse, name, payload):
+def _open_trace(langfuse, name, payload, metadata=None):
     if langfuse is None:
         return None
-    trace = _Trace(name, payload)
+    trace = _Trace(name, trace_data(payload), metadata=trace_data(metadata or {}))
     return {'span': trace, 'client': langfuse}
 
 
@@ -246,6 +259,8 @@ def _flush_ingestion(client, trace):
         'name': trace.name,
         'input': trace.input,
         'output': trace.output,
+        'metadata': trace.metadata,
+        'tags': ['revive', 'incident-diagnostics', 'trace-v2'],
     })]
     for child in trace.children:
         child.end()
@@ -295,7 +310,7 @@ def _close_trace(handle, output):
         return
     trace = handle['span']
     try:
-        trace.update_trace(output=output)
+        trace.update_trace(output=trace_data(output))
         trace.end()
     except Exception:
         logger.exception('Langfuse trace update failed')
@@ -322,13 +337,21 @@ def _child_span(langfuse, name, payload, as_type='span', model=None, parent=None
         return
     observation = _Observation(
         name,
-        _compact(payload),
+        trace_data(payload),
         kind='generation' if as_type == 'generation' else 'span',
         model=model,
     )
     trace.children.append(observation)
     try:
         yield observation
+    except Exception as exc:
+        if observation.output is None:
+            _set_output(observation, {
+                'status': 'error',
+                'summary': 'This diagnostic step raised an exception.',
+                'error_type': exc.__class__.__name__,
+            })
+        raise
     finally:
         try:
             observation.end()
@@ -337,17 +360,11 @@ def _child_span(langfuse, name, payload, as_type='span', model=None, parent=None
 
 
 def _set_output(span, output):
+    """Update only the result. Keep the original span input for causality."""
     if span is None:
         return
-    payload = _compact(output, 8000)
     try:
-        if hasattr(span, 'update'):
-            span.update(input=payload, output=payload)
-    except TypeError:
-        try:
-            span.update(output=payload)
-        except Exception:
-            logger.exception('Langfuse child update failed')
+        span.update(output=trace_data(output))
     except Exception:
         logger.exception('Langfuse child update failed')
 
@@ -884,7 +901,20 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
             if incident_context else container_summary,
     }
     langfuse = get_langfuse()
-    handle = _open_trace(langfuse, 'hierarchical_diagnostic_routing', {'incident_raw': user_message})
+    trace_scope = resource_scope if isinstance(resource_scope, dict) else {}
+    trace_alert = incident_context.get('alert') or {}
+    trace_metadata = {
+        'schema_version': TRACE_SCHEMA,
+        'source': trace_alert.get('source') or trace_scope.get('source'),
+        'resource': trace_alert.get('resource') or trace_scope.get('resource'),
+        'incident_id': trace_scope.get('incident_id'),
+    }
+    handle = _open_trace(
+        langfuse,
+        'Revive | Incident diagnosis',
+        trace_input(routing_message or user_message, incident_context, resource_scope),
+        metadata=trace_metadata,
+    )
     parent = handle['span'] if handle else None
     decisions = {}
     evidence = {}
@@ -895,22 +925,14 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
     engine_status = 'ok'
     reply_text = ''
     agent = {'agent_triggered': False, 'sandbox_output': None}
+    monitoring_override = False
     try:
-        with _child_span(langfuse, 'incident_context', {
+        with _child_span(langfuse, STAGES['context'], {
             'source': (incident_context.get('alert') or {}).get('source'),
             'resource': (incident_context.get('alert') or {}).get('resource'),
         }, parent=parent) as incident_span:
-            _set_output(incident_span, {
-                'alert': incident_context.get('alert'),
-                'errors': incident_context.get('errors'),
-                'evidence_status': incident_context.get('evidence_status'),
-                'window_minutes': incident_context.get('window_minutes'),
-                'sample_counts': {
-                    key: len(value) for key, value in (incident_context.get('evidence') or {}).items()
-                    if isinstance(value, list)
-                },
-            })
-        with _child_span(langfuse, 'laya', {
+            _set_output(incident_span, context_view(incident_context))
+        with _child_span(langfuse, STAGES['routing'], {
             'message': route_input, 'snapshot': context['fleet_anomaly_snapshot']
         }, parent=parent) as laya_span:
             decisions = route(route_input, context)
@@ -933,40 +955,21 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
                 'need_deployment_changes': bool(decisions.get('need_deployment_changes')),
                 'need_runbook_search': bool(decisions.get('need_runbook_search')),
             }
-            _set_output(laya_span, route_view)
+            _set_output(laya_span, routing_view(route_view))
         query = retrieval_query_text(decisions, incident_context, route_input)
-        with _child_span(langfuse, 'runbook_retrieval', {
+        with _child_span(langfuse, STAGES['retrieval'], {
             'query': query,
             'section': decisions.get('incident_family', 'unknown'),
         }, parent=parent) as retrieval_span:
             retrieval = retrieve(query, decisions)
             hits = retrieval.get('results', [])
             documents = [hit['text'] for hit in hits]
-            _set_output(retrieval_span, {
-                'section': decisions.get('incident_family', 'unknown'),
-                'query': query,
-                'retrieval_source': retrieval.get('source'),
-                'candidate_count': retrieval.get('candidate_count'),
-                'filters': retrieval.get('filters'),
-                'hits': [
-                    {
-                        'title': hit.get('title'),
-                        'document_id': hit.get('document_id'),
-                        'section': hit.get('section'),
-                        'component': hit.get('component'),
-                        'chunk': hit.get('chunk'),
-                        'distance': hit.get('distance'),
-                        'lexical_score': hit.get('lexical_score'),
-                        'relevance_score': hit.get('relevance_score'),
-                        'matched_terms': hit.get('matched_terms'),
-                        'retrieval_source': hit.get('retrieval_source'),
-                    }
-                    for hit in hits
-                ],
-                'runbooks': [_compact(document, 1000) for document in documents[:3]],
-            })
+            _set_output(retrieval_span, retrieval_view(query, retrieval))
         try:
-            with _child_span(langfuse, 'telemetry', {'route': route_view}, parent=parent) as telemetry_span:
+            with _child_span(langfuse, STAGES['telemetry'], {
+                'selected_family': decisions.get('incident_family'),
+                'evidence_origin': incident_context.get('evidence_status', 'legacy'),
+            }, parent=parent) as telemetry_span:
                 # Reuse exactly the same, time-bounded evidence sent to Laya/Chroma.
                 evidence = (
                     incident_context['evidence'] if incident_context
@@ -974,7 +977,11 @@ def diagnose(user_message: str, allow_remediation: bool = False, resource_scope=
                     else gather(decisions)
                 )
                 _set_output(telemetry_span, {
-                    'evidence_status': incident_context.get('evidence_status', 'legacy'),
+                    'status': incident_context.get('evidence_status', 'legacy'),
+                    'summary': (
+                        context_view(incident_context)['summary'] if incident_context
+                        else 'Legacy telemetry gathered; no linked Incident context was supplied.'
+                    ),
                     'sample_counts': {
                         key: len(value) for key, value in evidence.items() if isinstance(value, list)
                     },
@@ -1020,10 +1027,24 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
 """
         retry_prompt = system_prompt + '\nThe previous reply was rejected. Return only the JSON object.'
         try:
-            with _child_span(langfuse, 'llm', {'packet': _compact(packet, 1500)}, as_type='generation', model=target_model, parent=parent) as llm_span:
+            with _child_span(langfuse, STAGES['llm'], {
+                'model': target_model,
+                'alert_or_question': trace_input(routing_message or user_message, incident_context, resource_scope)['alert_or_question'],
+                'observed_error_count': len(incident_context.get('errors') or []),
+                'runbooks_considered': [
+                    hit.get('title') for hit in retrieval.get('results', [])[:3]
+                ],
+            }, as_type='generation', model=target_model, parent=parent) as llm_span:
                 reply_text = _chat(ollama_host, target_model, system_prompt, packet)
-                _set_output(llm_span, {'reply': reply_text})
+                _set_output(llm_span, diagnosis_view(
+                    reply_text, 'ok' if _parse_diagnosis(reply_text) else 'invalid'
+                ))
         except Exception as exc:
+            _set_output(llm_span, {
+                'status': 'offline',
+                'summary': 'The model request failed.',
+                'error_type': exc.__class__.__name__,
+            })
             engine_status = 'offline'
             reply_text = json.dumps({
                 'incident_detected': False,
@@ -1036,11 +1057,20 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
             parsed = _parse_diagnosis(reply_text)
             if parsed is None:
                 try:
-                    with _child_span(langfuse, 'llm_retry', {'packet': _compact(packet, 1500)}, as_type='generation', model=target_model, parent=parent) as retry_span:
+                    with _child_span(langfuse, STAGES['llm_retry'], {
+                        'model': target_model, 'reason': 'Initial model response was invalid.'
+                    }, as_type='generation', model=target_model, parent=parent) as retry_span:
                         reply_text = _chat(ollama_host, target_model, retry_prompt, packet)
-                        _set_output(retry_span, {'reply': reply_text})
+                        _set_output(retry_span, diagnosis_view(
+                            reply_text, 'ok' if _parse_diagnosis(reply_text) else 'invalid'
+                        ))
                     parsed = _parse_diagnosis(reply_text)
-                except Exception:
+                except Exception as exc:
+                    _set_output(retry_span, {
+                        'status': 'error',
+                        'summary': 'The retry did not produce a valid model response.',
+                        'error_type': exc.__class__.__name__,
+                    })
                     logger.exception('diagnosis retry failed')
                     parsed = None
             if parsed is None:
@@ -1055,6 +1085,7 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
                     'failure', 'unstable', 'aborted', 'firing', 'critical', 'warning',
                 }
                 if observed_status in active_statuses and not parsed['incident_detected']:
+                    monitoring_override = True
                     alert = incident_context['alert']
                     parsed['incident_detected'] = True
                     parsed['diagnostic_report'] = (
@@ -1067,43 +1098,32 @@ Return only JSON with keys incident_detected (boolean), error_scope (string), di
                     parsed['tool_name'] = ''
                     parsed['tool_target'] = ''
                 reply_text = json.dumps(parsed)
-        if allow_remediation and engine_status == 'ok':
-            allowed_target = resource_scope.get('resource') if isinstance(resource_scope, dict) else None
-            agent = maybe_execute(reply_text, decisions, allowed_target=allowed_target)
-            _confirm_recovery(agent, decisions)
+        with _child_span(langfuse, STAGES['remediation'], {
+            'authorized': bool(allow_remediation),
+            'allowed_target': trace_scope.get('resource'),
+        }, parent=parent) as action_span:
+            if allow_remediation and engine_status == 'ok':
+                allowed_target = trace_scope.get('resource')
+                agent = maybe_execute(reply_text, decisions, allowed_target=allowed_target)
+                _confirm_recovery(agent, decisions)
+            _set_output(action_span, remediation_view(allow_remediation, agent))
+    except Exception:
+        engine_status = 'error'
+        logger.exception('Incident diagnostic pipeline failed')
+        raise
     finally:
-        _close_trace(handle, {
-            'engine_status': engine_status,
-            'incident_context': {
-                'alert': incident_context.get('alert'),
-                'errors': incident_context.get('errors'),
-                'evidence_status': incident_context.get('evidence_status'),
-            },
-            'laya': route_view,
-            'runbook_retrieval': {
-                'query': query,
-                'retrieval_source': retrieval.get('source'),
-                'candidate_count': retrieval.get('candidate_count'),
-                'filters': retrieval.get('filters'),
-                'hits': [
-                    {
-                        'title': hit.get('title'),
-                        'document_id': hit.get('document_id'),
-                        'section': hit.get('section'),
-                        'component': hit.get('component'),
-                        'distance': hit.get('distance'),
-                        'lexical_score': hit.get('lexical_score'),
-                        'relevance_score': hit.get('relevance_score'),
-                        'matched_terms': hit.get('matched_terms'),
-                        'retrieval_source': hit.get('retrieval_source'),
-                    }
-                    for hit in retrieval.get('results', [])
-                ],
-                'runbooks': [_compact(document, 1000) for document in documents[:3]],
-            },
-            'reply': _compact(reply_text, 4000),
-        })
-    return {'reply': reply_text, 'engine_status': engine_status, 'agent_automation': agent, 'decisions': decisions}
+        _close_trace(handle, trace_summary(
+            incident_context, routing_message or user_message,
+            route_view, retrieval, reply_text, engine_status, agent,
+            allow_remediation, query=query, monitoring_override=monitoring_override,
+        ))
+    return {
+        'reply': reply_text,
+        'engine_status': engine_status,
+        'agent_automation': agent,
+        'decisions': decisions,
+        'trace_id': handle['span'].id if handle else None,
+    }
 
 
 def monitor_incident_daemon():
