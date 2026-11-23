@@ -188,7 +188,7 @@ def retrieval_view(query, retrieval):
     }
 
 
-def diagnosis_view(reply_text, engine_status):
+def diagnosis_view(reply_text, engine_status, monitoring_override=False):
     try:
         parsed = json.loads(reply_text)
     except (TypeError, ValueError):
@@ -203,7 +203,8 @@ def diagnosis_view(reply_text, engine_status):
             else "Model response could not be validated." if engine_status == "invalid"
             else "The model returned a diagnostic assessment, not proof of recovery."
         ),
-        "incident_detected_by_model": parsed.get("incident_detected") if isinstance(parsed.get("incident_detected"), bool) else None,
+        "incident_detected_in_response": parsed.get("incident_detected") if isinstance(parsed.get("incident_detected"), bool) else None,
+        "detection_basis": "monitoring_record" if monitoring_override else "model_response",
         "error_scope": safe_text(parsed.get("error_scope"), 100),
         "assessment": safe_text(parsed.get("diagnostic_report"), 900),
         "evidence_references": [
@@ -247,11 +248,11 @@ def remediation_view(requested, agent):
     }
 
 
-def trace_summary(context, message, route, retrieval, reply_text, engine_status, agent, allow_remediation, query=""):
+def trace_summary(context, message, route, retrieval, reply_text, engine_status, agent, allow_remediation, query="", monitoring_override=False):
     observed = context_view(context)
     routed = routing_view(route)
     searched = retrieval_view(query, retrieval)
-    diagnosis = diagnosis_view(reply_text, engine_status)
+    diagnosis = diagnosis_view(reply_text, engine_status, monitoring_override=monitoring_override)
     remediation = remediation_view(allow_remediation, agent)
     return {
         "schema_version": TRACE_SCHEMA,
