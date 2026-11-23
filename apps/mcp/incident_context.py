@@ -31,7 +31,7 @@ def _redact(value, limit=240):
 
 def _error_lines(text, limit=3):
     lines = []
-    for line in str(text or "").splitlines():
+    for line in reversed(str(text or "").splitlines()):
         if _ERROR_LINE.search(line):
             cleaned = _redact(line)
             if cleaned and cleaned not in lines:
