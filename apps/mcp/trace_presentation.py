@@ -92,6 +92,30 @@ def context_view(context):
     errors = context.get("errors") or []
     evidence = context.get("evidence") or {}
     status = context.get("evidence_status") or "unavailable"
+    pipeline = None
+    for group in ("ci_pipeline_logs", "incident_record_snapshot"):
+        for row in evidence.get(group) or []:
+            if not isinstance(row, dict):
+                continue
+            candidate = row.get("failure_analysis")
+            if not isinstance(candidate, dict):
+                continue
+            pipeline = {
+                "diagnostic_status": candidate.get("diagnostic_status"),
+                "primary_error": safe_text(candidate.get("primary_error"), 300) or None,
+                "failing_stage": safe_text(candidate.get("failing_stage"), 130) or None,
+                "failing_command": safe_text(candidate.get("failing_command"), 250) or None,
+                "error_context": [
+                    safe_text(line, 240) for line in (candidate.get("error_context") or [])[:8]
+                ],
+                "execution_exit_code": candidate.get("execution_exit_code"),
+                "root_cause_confirmed": False,
+                "source": group,
+                "source_truncated": bool(candidate.get("source_truncated")),
+            }
+            break
+        if pipeline is not None:
+            break
     names = {
         "observed": "Matching source telemetry was found.",
         "incident_snapshot": "Using a stored Incident snapshot; live samples were unavailable.",
@@ -120,6 +144,7 @@ def context_view(context):
             name: len(rows) for name, rows in evidence.items() if isinstance(rows, list)
         },
         "correlation_window_minutes": context.get("window_minutes"),
+        "pipeline_failure": pipeline,
     }
 
 
@@ -265,6 +290,8 @@ def trace_summary(context, message, route, retrieval, reply_text, engine_status,
             "what_happened": observed["alert"]["message"] or safe_text(message, 300),
             "evidence_status": observed["status"],
             "observed_errors": [error["message"] for error in observed["observed_errors"]],
+            "pipeline_primary_error": (observed.get("pipeline_failure") or {}).get("primary_error"),
+            "pipeline_stage": (observed.get("pipeline_failure") or {}).get("failing_stage"),
             "routing": routed["summary"],
             "runbooks": searched["summary"],
             "ai_assessment": diagnosis["assessment"] or diagnosis["summary"],
