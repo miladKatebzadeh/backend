@@ -98,6 +98,51 @@ class JenkinsLogParserTests(SimpleTestCase):
         self.assertNotIn("private123", json.dumps(analysis))
         self.assertIn("[REDACTED]", saved)
 
+    def test_npm_help_and_debug_log_path_are_never_selected_as_root_error(self):
+        console = "\n".join([
+            "[Pipeline] stage",
+            "[Pipeline] { (Frontend tests)",
+            "[Pipeline] sh",
+            "+ git rev-parse --short=12 HEAD",
+            "npm error",
+            "npm error aliases: clean-install, ic, install-clean",
+            'npm error Run "npm help ci" for more info',
+            "npm error A complete log of this run can be found in: /tmp/.npm/_logs/debug.log",
+            "ERROR: script returned exit code 1",
+            "Finished: FAILURE",
+        ])
+        result = analyze_jenkins_console(console)
+        self.assertEqual(result["diagnostic_status"], "insufficient_console_detail")
+        self.assertIsNone(result["primary_error"])
+        self.assertIsNone(result["failing_command"])
+        self.assertNotIn("/tmp/.npm", str(result["error_lines"]))
+
+    def test_npm_ci_lockfile_problem_is_identified_and_associated_with_npm_command(self):
+        console = "\n".join([
+            "[Pipeline] stage",
+            "[Pipeline] { (Frontend tests)",
+            "[Pipeline] sh",
+            "+ npm ci",
+            "+ git rev-parse --short=12 HEAD",
+            "npm error code EUSAGE",
+            "npm error npm ci can only install packages when your package.json and package-lock.json are in sync.",
+            "npm error Missing: eslint@9.1.0 from lock file",
+            'npm error Run "npm help ci" for more info',
+            "npm error A complete log of this run can be found in: /tmp/debug.log",
+            "ERROR: script returned exit code 1",
+            "Finished: FAILURE",
+        ])
+        parsed = analyze_jenkins_console(console)
+        self.assertEqual(parsed["diagnostic_status"], "specific_error_found")
+        self.assertTrue(
+            "package-lock.json" in parsed["primary_error"]
+            or "Missing:" in parsed["primary_error"]
+        )
+        self.assertEqual(parsed["failing_stage"], "Frontend tests")
+        self.assertEqual(parsed["failing_command"], "npm ci")
+        self.assertNotIn("/tmp/debug", str(parsed["error_lines"]))
+        self.assertNotIn("git rev-parse", str(parsed["failing_command"]))
+
     def test_compiler_failure_is_specific_not_wrapper(self):
         source = "\n".join([
             "[Pipeline] { (TypeScript)",
@@ -241,6 +286,59 @@ class JenkinsEvidenceFlowTests(TestCase):
         self.assertIn("gunicorn", result["user_report"]["root_cause"])
         self.assertNotIn("Everything is healthy", json.dumps(result["user_report"]))
         self.assertFalse(result["agent_automation"]["agent_triggered"])
+
+    @patch("apps.mcp.incident_context.fetch_jenkins_build_console")
+    def test_incident_chat_retries_exact_build_and_recovers_real_npm_error(self, fetch):
+        old_console = "\n".join([
+            'npm error Run "npm help ci" for more info',
+            "npm error A complete log of this run can be found in: /tmp/.npm/debug.log",
+            "ERROR: script returned exit code 1",
+        ])
+        fresh_console = "\n".join([
+            "[Pipeline] { (Frontend tests)",
+            "+ npm ci",
+            "npm error code EUSAGE",
+            "npm error npm ci can only install packages when package.json and package-lock.json are in sync.",
+            "npm error A complete log of this run can be found in: /tmp/.npm/debug.log",
+            "ERROR: script returned exit code 1",
+        ])
+        fetch.return_value = fresh_console
+        JenkinsBuild.objects.create(
+            job_name="CSAI", build_number=6, result="FAILURE",
+            console_output=old_console, updated_at=self.now,
+        )
+        context = build_incident_context(
+            "CSAI Build #6 FAILURE",
+            {
+                "source": "jenkins", "resource": "CSAI", "status": "open",
+                "incident_id": 42, "snapshot": {"build_number": 6},
+            },
+            observed_at=self.now,
+        )
+        fetch.assert_called_once_with("CSAI", 6)
+        result = context["evidence"]["ci_pipeline_logs"][0]["failure_analysis"]
+        self.assertIn("package-lock.json", result["primary_error"])
+        self.assertEqual(result["failing_command"], "npm ci")
+        self.assertEqual(result["evidence_origin"], "jenkins_exact_build_refetch")
+        persisted = JenkinsBuild.objects.get(job_name="CSAI", build_number=6)
+        self.assertIn("package-lock.json", persisted.console_output)
+
+    @patch("apps.mcp.incident_context.fetch_jenkins_build_console")
+    def test_no_live_refetch_when_previous_jenkins_error_is_substantive(self, fetch):
+        analysis = analyze_jenkins_console(SAMPLE_JENKINS_CONSOLE)
+        JenkinsBuild.objects.create(
+            job_name="CSAI", build_number=6, result="FAILURE",
+            console_output=SAMPLE_JENKINS_CONSOLE,
+            raw_build_info={"failure_analysis": analysis},
+            updated_at=self.now,
+        )
+        build_incident_context(
+            "CSAI Build #6 FAILURE",
+            {"source": "jenkins", "resource": "CSAI", "status": "open",
+             "incident_id": 42, "snapshot": {"build_number": 6}},
+            observed_at=self.now,
+        )
+        fetch.assert_not_called()
 
     def test_source_scoped_historical_snapshot_carries_original_failure(self):
         snapshot = {
