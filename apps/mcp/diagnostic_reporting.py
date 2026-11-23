@@ -4,6 +4,7 @@ Monitoring evidence is authoritative about observed failures, while model
 hypotheses are only suggestions. A missing LLM must never erase an Incident.
 """
 import json
+import re
 
 from apps.mcp.trace_presentation import safe_text
 
@@ -151,12 +152,13 @@ def _english(text):
 def _manual_log_handoff(text):
     """A diagnostics product must not make the end user research raw logs."""
     lowered = text.lower()
-    return any(term in lowered for term in (
-        "check logs", "check the logs", "review logs", "inspect logs",
-        "open the log", "read the log", "examine the log",
-        "look at the log", "check console", "review console",
-        "inspect console", "debug log", "look through the log",
-    ))
+    return bool(re.search(
+        r"\\b(?:check|review|inspect|open|read|examine|search|look at)\\b"
+        r".{0,50}\\b(?:logs?|console|trace|debugging output)\\b",
+        lowered,
+    )) or any(term in lowered for term in (
+        "a complete log of this run", "npm help ci", "/tmp/.npm/_logs",
+    )))
 
 
 def _jenkins_recommendations(pipeline, defaults):
