@@ -6,7 +6,8 @@ hypotheses are only suggestions. A missing LLM must never erase an Incident.
 import json
 import re
 
-from apps.mcp.trace_presentation import safe_text
+from apps.mcp.trace_presentation import safe_text, trace_data
+from apps.mcp.source_reporting import describe_source_incident
 
 
 ACTIVE_STATUSES = {
@@ -206,7 +207,10 @@ def _jenkins_recommendations(pipeline, defaults):
     ], None
 
 
-def readable_report(incident_context, reply_text, engine_status, agent=None, retrieval=None, error=None):
+def readable_report(
+    incident_context, reply_text, engine_status, agent=None, retrieval=None,
+    error=None, operational_evidence=None, decisions=None,
+):
     """Create a plain-English, evidence-first report for every outcome.
 
     AI text is marked as a model assessment. For offline/invalid responses the
@@ -251,6 +255,14 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
         title = "Infrastructure assessment"
         summary = "A request to investigate the infrastructure was received."
 
+    source_insight = describe_source_incident(
+        context, operational_evidence=operational_evidence, decisions=decisions
+    )
+    if source_insight:
+        title = source_insight["title"]
+        summary = source_insight["summary"]
+        steps = source_insight["steps"]
+        verification = source_insight["verification"]
     pipeline_failure = None
     for group in ("ci_pipeline_logs", "incident_record_snapshot"):
         for item in (context.get("evidence") or {}).get(group, []):
@@ -260,7 +272,10 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
         if pipeline_failure is not None:
             break
 
-    root_cause = "The root cause is not yet confirmed by the available evidence."
+    root_cause = (
+        source_insight["root_cause"] if source_insight
+        else "The root cause is not yet confirmed by the available evidence."
+    )
     if source == "jenkins" and pipeline_failure:
         primary = pipeline_failure.get("primary_error")
         steps, explanation = _jenkins_recommendations(pipeline_failure, steps)
@@ -303,15 +318,19 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
             source == "jenkins" and pipeline_failure
             and not pipeline_failure.get("primary_error")
         )
+        # Preserve source-verified observations and targeted actions over
+        # speculative model text, even when the model returns valid JSON.
+        evidence_owned_report = bool(source_insight)
         model_summary = model_report.get("summary") or parsed.get("diagnostic_report")
         if (
-            not no_specific_jenkins_error and _english(model_summary)
-            and not _manual_log_handoff(model_summary)
+            not no_specific_jenkins_error and not evidence_owned_report
+            and _english(model_summary) and not _manual_log_handoff(model_summary)
         ):
             summary = safe_text(model_summary, 1050)
         suggested_cause = model_report.get("likely_cause")
         if (
-            not no_specific_jenkins_error and _english(suggested_cause)
+            not no_specific_jenkins_error and not evidence_owned_report
+            and _english(suggested_cause)
             and suggested_cause.strip().lower() not in ("unknown", "n/a", "none")
             and not _manual_log_handoff(suggested_cause)
         ):
@@ -320,12 +339,17 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
         proposed_checks = _list_of_text(model_report.get("verification_steps"), limit=4)
         usable_steps = [step for step in proposed_steps if _english(step) and not _manual_log_handoff(step)]
         usable_checks = [check for check in proposed_checks if _english(check) and not _manual_log_handoff(check)]
-        if usable_steps and not no_specific_jenkins_error:
+        if usable_steps and not no_specific_jenkins_error and not evidence_owned_report:
             steps = usable_steps
-        if usable_checks and not no_specific_jenkins_error:
+        if usable_checks and not no_specific_jenkins_error and not evidence_owned_report:
             verification = usable_checks
         report_status = "ai_assessment"
-        ai_note = "AI assessment is available. The proposed cause and recovery remain unverified until monitored evidence confirms them."
+        ai_note = (
+            "AI was consulted. Revive's source observations and evidence-matched "
+            "next steps take precedence over unverified model hypotheses."
+            if source_insight else
+            "AI assessment is available. The proposed cause and recovery remain unverified until monitored evidence confirms them."
+        )
     else:
         report_status = "ai_unavailable" if engine_status == "offline" else "ai_unusable"
         ai_note = (
@@ -363,6 +387,7 @@ def readable_report(incident_context, reply_text, engine_status, agent=None, ret
         "ai_status": engine_status,
         "ai_note": ai_note,
         "runbook_count": len(matched),
+        "source_assessment": trace_data((source_insight or {}).get("source")) if source_insight else None,
         "pipeline_failure": {
             "diagnostic_status": pipeline_failure.get("diagnostic_status"),
             "primary_error": safe_text(pipeline_failure.get("primary_error"), 350) or None,
