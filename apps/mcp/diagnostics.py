@@ -1162,6 +1162,9 @@ explicitly say that no matching Runbook was found.
                         "Review the failure context and verify recovery manually."
                     )
                     parsed['error_scope'] = decisions.get('incident_family') or 'engine'
+                    # Discard a contradictory model-authored report when the model
+                    # denied an independently observed Incident.
+                    parsed.pop('user_report', None)
                     parsed['evidence_refs'] = (
                         ['jenkins_console', 'monitored incident alert']
                         if found_error else ['monitored incident alert']
